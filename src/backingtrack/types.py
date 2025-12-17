@@ -9,6 +9,7 @@ Seconds = float
 BPM = float
 MidiPitch = int
 Velocity = int
+PitchClass = int
 
 Mode = Literal["major", "minor"]
 
@@ -89,3 +90,14 @@ class MidiInfo:
             raise ValueError(f"duration must be >= 0, got {self.duration}")
         if self.tempo_bpm <= 0:
             raise ValueError(f"tempo_bpm must be > 0, got {self.tempo_bpm}")
+
+@dataclass(frozen=True)
+class KeyEstimate:
+    tonic_pc: int          # 0..11
+    mode: Mode             # "major" or "minor"
+    confidence: float = 0.0  # 0..1
+
+    def __post_init__(self) -> None:
+        _clamp_int(int(self.tonic_pc), 0, 11, "tonic_pc")
+        if not (0.0 <= float(self.confidence) <= 1.0):
+            raise ValueError(f"confidence must be in [0,1], got {self.confidence}")
