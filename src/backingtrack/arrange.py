@@ -47,6 +47,9 @@ def arrange_backing(
     pad_octave: int = 4,
     seed: Optional[int] = None,
     structure_mode: str = "none",   # "none" or "auto"
+    drums_mode: str = "rules",      # "rules" or "ml"
+    ml_drums_model_path: str = "data/ml/drum_model.pt",
+    ml_drums_temperature: float = 1.05,
 ) -> Arrangement:
     rng = random.Random(seed)
 
@@ -71,7 +74,22 @@ def arrange_backing(
         tracks["pad"] = _make_pad(chords, grid, mood, pad_octave=pad_octave, structure=structure)
 
     if make_drums:
-        tracks["drums"] = _make_drums(chords, grid, mood, rng=rng, structure=structure)
+        if drums_mode == "ml":
+            try:
+                tracks["drums"] = _make_drums_ml(
+                    chords,
+                    grid,
+                    mood,
+                    seed=seed,
+                    num_bars=num_bars,
+                    structure=structure,
+                    model_path=ml_drums_model_path,
+                    temperature=ml_drums_temperature,
+                )
+            except ValueError:
+                tracks["drums"] = _make_drums(chords, grid, mood, rng=rng, structure=structure)
+        else:
+            tracks["drums"] = _make_drums(chords, grid, mood, rng=rng, structure=structure)
 
     return Arrangement(tracks=tracks)
 
@@ -338,6 +356,65 @@ def _nearest_midi_for_pc(pc: int, *, around: int, lo: int, hi: int) -> int:
 # -------------------------
 # Drums
 # -------------------------
+
+def _make_drums_ml(
+    chords: Sequence[ChordEvent],
+    grid: BarGrid,
+    mood: MoodPreset,
+    *,
+    seed: Optional[int],
+    num_bars: int,
+    structure: Optional[SongStructure],
+    model_path: str,
+    temperature: float,
+) -> List[Note]:
+    """
+    ML drums generator.
+    Uses your trained model (data/ml/drum_model.pt) to generate num_bars bars,
+    then optionally applies section rules (intro no-drums, ride in chorus, intensity scaling).
+    """
+    # Lazy import so torch isn’t required unless you actually use ML drums
+    from backingtrack.ml_drums.infer import SampleConfig, generate_ml_drums
+
+    scfg = SampleConfig(
+        bars=int(num_bars),
+        temperature=float(temperature),
+        stochastic=True,
+        seed=seed,
+        intensity=1.0,  # we’ll scale per-bar below using structure intensity
+    )
+
+    notes = generate_ml_drums(model_path, grid, scfg=scfg)
+
+    if not structure:
+        return notes
+
+    out: List[Note] = []
+    for n in notes:
+        bar = grid.bar_index_at(n.start)
+        st = structure.style_for_bar(bar)
+
+        # Respect intro sections where drums are off
+        if not st.drums_enabled:
+            continue
+
+        pitch = n.pitch
+
+        # Very simple “hat type” enforcement:
+        # if section wants ride, convert closed hats to ride
+        if st.hat == "ride" and pitch == CLOSED_HH:
+            pitch = RIDE
+        if st.hat == "closed" and pitch == RIDE:
+            pitch = CLOSED_HH
+
+        # Scale velocity by section intensity (keeps chorus hotter than verse)
+        inten = float(st.intensity)
+        scale = 0.55 + 0.70 * inten  # ~0.8 in verses, ~1.1 in choruses
+        vel = int(max(1, min(127, round(n.velocity * scale))))
+
+        out.append(Note(pitch=int(pitch), start=float(n.start), end=float(n.end), velocity=int(vel)))
+
+    return out
 
 def _make_drums(
     chords: Sequence[ChordEvent],

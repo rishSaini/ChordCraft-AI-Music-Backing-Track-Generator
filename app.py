@@ -99,6 +99,9 @@ with left:
     make_pad = st.toggle("Pad", value=True)
     make_drums = st.toggle("Drums", value=True)
 
+    drums_mode = st.selectbox("Drums", ["rules", "ml"], index=0)
+    ml_temp = st.slider("ML drum temperature", 0.8, 1.4, 1.05, 0.01)
+
     st.markdown("</div>", unsafe_allow_html=True)
 
     generate_btn = st.button("✨ Generate backing track", use_container_width=True, disabled=(uploaded is None))
@@ -141,11 +144,11 @@ def run_pipeline(midi_bytes: bytes, mood_name: str, bars_per_chord: int, quantiz
         chords=chords,
         grid=grid,
         mood=mood,
-        make_bass=make_bass,
-        make_pad=make_pad,
-        make_drums=make_drums,
-        structure_mode=structure_mode, 
-        seed=seed
+        seed=seed,
+        structure_mode=structure_mode,
+        drums_mode=drums_mode,
+        ml_drums_model_path="data/ml/drum_model.pt",
+        ml_drums_temperature=ml_temp,
     )
 
     if humanize:
