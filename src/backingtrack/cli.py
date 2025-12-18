@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import pretty_midi
 import typer
 
 from .midi_io import load_and_prepare
@@ -19,13 +20,27 @@ from .humanize import HumanizeConfig, humanize_arrangement
 
 app = typer.Typer(add_completion=False, help="AI MIDI backing-track generator (v1 baseline).")
 
+def _parse_indices(csv: Optional[str]) -> list[int]:
+    if not csv:
+        return []
+    out: list[int] = []
+    for part in csv.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(int(part))
+    return sorted(set(out))
 
 @app.command()
 def generate(
     input_midi: Path = typer.Argument(..., exists=True, readable=True, help="Input MIDI file (.mid/.midi)"),
     output_midi: Path = typer.Option(Path("data/generated/out.mid"), "--out", "-o", help="Output MIDI path"),
     mood: str = typer.Option("neutral", "--mood", "-m", help=f"Mood preset. Options: {', '.join(list_moods())}"),
-    melody_track: Optional[int] = typer.Option(None, "--melody-track", help="Instrument index to treat as melody (0-based)"),
+    melody_tracks: Optional[str] = typer.Option(
+        None,
+        "--melody-tracks",
+        help="Comma-separated instrument indices to render as the lead (e.g. 0,2,5). If omitted, auto-pick is used.",
+    ),
     bars_per_chord: int = typer.Option(1, "--bars-per-chord", help="How many bars each chord lasts"),
     quantize_melody: bool = typer.Option(False, "--quantize-melody", help="Quantize melody note times to the beat grid"),
     no_drums: bool = typer.Option(False, "--no-drums", help="Disable drum track generation"),
@@ -35,29 +50,43 @@ def generate(
     jitter_ms: float = typer.Option(15.0, "--jitter-ms", help="Timing jitter amount in milliseconds"),
     vel_jitter: int = typer.Option(8, "--vel-jitter", help="Velocity jitter amount"),
     swing: float = typer.Option(0.15, "--swing", help="Swing amount 0..1 (offbeat delay)"),
-    seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for deterministic humanization"),
+    seed: Optional[int] = typer.Option(None, "--seed", help="Random seed (also used for arrangement)"),
     structure: str = typer.Option("none", "--structure", help="Song structure: none | auto"),
+    drums_mode: str = typer.Option("rules", "--drums-mode", help="Drums: rules | ml"),
+    ml_temp: float = typer.Option(1.05, "--ml-temp", help="ML drum temperature (if drums_mode=ml)"),
 ):
-    """
-    Generate a backing track (bass/pad/drums) for a MIDI melody.
-    """
-    # 1) Load MIDI, extract global info + grid, pick melody instrument
-    pm, info, grid, melody_inst, sel = load_and_prepare(input_midi, melody_instrument_index=melody_track)
+    # Load + auto-pick melody for baseline metadata/grid
+    requested = _parse_indices(melody_tracks)
+    first_idx = requested[0] if requested else None
 
-    typer.echo(f"Picked melody track: idx={sel.instrument_index}, name='{sel.instrument_name}', is_drum={sel.is_drum}")
+    pm, info, grid, melody_inst, sel = load_and_prepare(input_midi, melody_instrument_index=first_idx)
+
+    # Decide which instruments are the "lead"
+    if requested:
+        for i in requested:
+            if i < 0 or i >= len(pm.instruments):
+                raise typer.BadParameter(f"melody track index {i} out of range (0..{len(pm.instruments)-1})")
+        melody_source_insts = [pm.instruments[i] for i in requested]
+        typer.echo(f"Using melody tracks (lead): {requested}")
+    else:
+        melody_source_insts = [melody_inst]
+        typer.echo(f"Auto-picked melody track: idx={sel.instrument_index}, name='{sel.instrument_name}', is_drum={sel.is_drum}")
+
     typer.echo(f"Tempo: {info.tempo_bpm:.2f} BPM | Time signature: {info.time_signature.numerator}/{info.time_signature.denominator}")
     typer.echo(f"Duration: {info.duration:.2f}s")
 
-    # 2) Extract melody notes (monophonic)
-    mel_cfg = MelodyConfig(quantize_to_beat=quantize_melody)
-    melody_notes = extract_melody_notes(melody_inst, grid=grid, config=mel_cfg)
+    # Build one combined instrument for analysis (key/chords) across all selected lead tracks
+    analysis_inst = pretty_midi.Instrument(program=int(melody_source_insts[0].program), is_drum=False, name="Analysis")
+    analysis_inst.notes = [n for inst in melody_source_insts for n in inst.notes]
+    analysis_inst.notes.sort(key=lambda n: (n.start, n.pitch))
 
+    mel_cfg = MelodyConfig(quantize_to_beat=quantize_melody)
+    melody_notes = extract_melody_notes(analysis_inst, grid=grid, config=mel_cfg)
     if not melody_notes:
         raise typer.Exit(code=1)
 
     typer.echo(f"Melody notes extracted: {len(melody_notes)}")
 
-    # 3) Detect key, apply mood “nudge”
     mood_preset = get_mood(mood)
     raw_key = estimate_key(melody_notes)
     key = apply_mood_to_key(raw_key, mood_preset)
@@ -66,7 +95,6 @@ def generate(
     if key != raw_key:
         typer.echo(f"After mood '{mood_preset.name}' bias: {key_to_string(key)}")
 
-    # 4) Generate chords
     chords = generate_chords(
         key=key,
         grid=grid,
@@ -77,7 +105,6 @@ def generate(
     )
     typer.echo(f"Chords generated: {len(chords)} (bars_per_chord={bars_per_chord})")
 
-    # 5) Arrange backing tracks
     arrangement = arrange_backing(
         chords=chords,
         grid=grid,
@@ -87,6 +114,9 @@ def generate(
         make_drums=not no_drums,
         seed=seed,
         structure_mode=structure,
+        drums_mode=drums_mode,
+        ml_drums_model_path="data/ml/drum_model.pt",
+        ml_drums_temperature=ml_temp,
     )
 
     if humanize:
@@ -96,15 +126,14 @@ def generate(
             HumanizeConfig(timing_jitter_ms=jitter_ms, velocity_jitter=vel_jitter, swing=swing, seed=seed),
         )
 
-
     counts = {k: len(v) for k, v in arrangement.tracks.items()}
     typer.echo(f"Backing note counts: {counts}")
 
-    # 6) Render + write MIDI
-    render_cfg = RenderConfig(write_metadata=True)
-    out_path = write_midi(output_midi, melody_notes, arrangement, info, config=render_cfg)
-    typer.echo(f"Wrote: {out_path.resolve()}")
-
+    # Render: pass melody_source_insts so we preserve CC64 sustain/etc across ALL lead tracks
+    render_cfg = RenderConfig(melody_program=int(melody_source_insts[0].program))
+    write_midi(output_midi, [], arrangement, info, config=render_cfg, melody_source_insts=melody_source_insts)
+    typer.echo(f"Wrote: {output_midi.resolve()}")
+    
 
 def main():
     app()

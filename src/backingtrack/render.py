@@ -1,16 +1,15 @@
 # src/backingtrack/render.py
-
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import pretty_midi
 
-from .types import MidiInfo, Note, TimeSignature
 from .arrange import Arrangement, TrackName
-
+from .types import MidiInfo, Note, TimeSignature
 
 # Reasonable GM programs (0-127). These are General MIDI instrument programs:
 # 0 = Acoustic Grand Piano, 33 = Electric Bass (finger), 48 = Strings Ensemble 1
@@ -37,16 +36,14 @@ class RenderConfig:
     bass_program: int = DEFAULT_PROGRAMS["bass"]
     pad_program: int = DEFAULT_PROGRAMS["pad"]
 
-    # If True, we write tempo + time signature meta events at time 0.
     write_metadata: bool = True
-
-    # If provided, use this as the output tempo (otherwise use MidiInfo.tempo_bpm).
     override_tempo_bpm: Optional[float] = None
 
 
-def _to_pretty_midi_note(n: Note) -> pretty_midi.Note:
+def _to_pretty_midi_note(n: Note, vel_scale: float = 1.0) -> pretty_midi.Note:
+    v = int(max(1, min(127, round(int(n.velocity) * vel_scale))))
     return pretty_midi.Note(
-        velocity=int(n.velocity),
+        velocity=v,
         pitch=int(n.pitch),
         start=float(n.start),
         end=float(n.end),
@@ -59,10 +56,10 @@ def _notes_to_instrument(
     program: int,
     name: str,
     is_drum: bool = False,
+    vel_scale: float = 1.0,
 ) -> pretty_midi.Instrument:
     inst = pretty_midi.Instrument(program=int(program), is_drum=bool(is_drum), name=name)
-    inst.notes = [_to_pretty_midi_note(n) for n in notes]
-    # Keep notes sorted (nice for debugging + some MIDI players)
+    inst.notes = [_to_pretty_midi_note(n, vel_scale=vel_scale) for n in notes]
     inst.notes.sort(key=lambda x: (x.start, x.pitch))
     return inst
 
@@ -72,74 +69,53 @@ def build_pretty_midi(
     arrangement: Arrangement,
     info: MidiInfo,
     config: RenderConfig = RenderConfig(),
+    melody_source_insts: Optional[Sequence[pretty_midi.Instrument]] = None,
 ) -> pretty_midi.PrettyMIDI:
-    """
-    Build a PrettyMIDI object containing:
-      - Melody track
-      - Bass track (if present)
-      - Pad track (if present)
-      - Drum track (if present)
-
-    This does NOT write to disk. Use write_midi(...) for that.
-    """
     tempo = float(config.override_tempo_bpm) if config.override_tempo_bpm is not None else float(info.tempo_bpm)
-
-    # PrettyMIDI lets you set an initial tempo at construction time.
     pm = pretty_midi.PrettyMIDI(initial_tempo=tempo)
 
-    # Write time signature metadata (optional)
     if config.write_metadata:
         ts: TimeSignature = info.time_signature
         pm.time_signature_changes.append(
             pretty_midi.TimeSignature(int(ts.numerator), int(ts.denominator), time=0.0)
         )
-        # tempo is already set via initial_tempo
 
-    # Melody
-    if melody_notes:
-        melody_inst = _notes_to_instrument(
-            melody_notes,
-            program=config.melody_program,
-            name=DEFAULT_NAMES["melody"],
-            is_drum=False,
+    # Melody (preferred: deep-copy original instrument(s) so pedal/CC/pitch bends are preserved)
+    if melody_source_insts:
+        for j, src in enumerate(melody_source_insts):
+            lead = deepcopy(src)
+            lead.is_drum = False
+            lead.name = DEFAULT_NAMES["melody"] if len(melody_source_insts) == 1 else f"Melody {j + 1}"
+            # NOTE: we keep each instrument’s original program by default.
+            pm.instruments.append(lead)
+    elif melody_notes:
+        pm.instruments.append(
+            _notes_to_instrument(
+                melody_notes,
+                program=config.melody_program,
+                name=DEFAULT_NAMES["melody"],
+                is_drum=False,
+            )
         )
-        pm.instruments.append(melody_inst)
 
-    # Backing tracks
     tracks: Dict[TrackName, Sequence[Note]] = arrangement.tracks
 
     bass_notes = tracks.get("bass", [])
     if bass_notes:
         pm.instruments.append(
-            _notes_to_instrument(
-                bass_notes,
-                program=config.bass_program,
-                name=DEFAULT_NAMES["bass"],
-                is_drum=False,
-            )
+            _notes_to_instrument(bass_notes, program=config.bass_program, name=DEFAULT_NAMES["bass"], is_drum=False)
         )
 
     pad_notes = tracks.get("pad", [])
     if pad_notes:
         pm.instruments.append(
-            _notes_to_instrument(
-                pad_notes,
-                program=config.pad_program,
-                name=DEFAULT_NAMES["pad"],
-                is_drum=False,
-            )
+            _notes_to_instrument(pad_notes, program=config.pad_program, name=DEFAULT_NAMES["pad"], is_drum=False)
         )
 
     drum_notes = tracks.get("drums", [])
     if drum_notes:
-        # For drums, program is ignored by most players; must set is_drum=True.
         pm.instruments.append(
-            _notes_to_instrument(
-                drum_notes,
-                program=0,
-                name=DEFAULT_NAMES["drums"],
-                is_drum=True,
-            )
+            _notes_to_instrument(drum_notes, program=0, name=DEFAULT_NAMES["drums"], is_drum=True)
         )
 
     return pm
@@ -151,14 +127,17 @@ def write_midi(
     arrangement: Arrangement,
     info: MidiInfo,
     config: RenderConfig = RenderConfig(),
+    melody_source_insts: Optional[Sequence[pretty_midi.Instrument]] = None,
 ) -> Path:
-    """
-    Build and write the MIDI file to disk.
-    Returns the output path.
-    """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    pm = build_pretty_midi(melody_notes, arrangement, info, config=config)
+    pm = build_pretty_midi(
+        melody_notes,
+        arrangement,
+        info,
+        config=config,
+        melody_source_insts=melody_source_insts,
+    )
     pm.write(str(out))
     return out
