@@ -1,6 +1,8 @@
 # app.py
 from __future__ import annotations
 
+from backingtrack.ml_harmony.infer import predict_chords_ml
+
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -168,6 +170,18 @@ with left:
     drums_mode = st.selectbox("Drums", ["rules", "ml"], index=0)
     ml_temp = st.slider("ML drum temperature", 0.8, 1.4, 1.05, 0.01)
 
+    harmony_mode = st.selectbox("Harmony (chords)", ["baseline", "ml"], index=0)
+
+    ml_chord_model_path = "data/ml/chord_model.pt"
+    ml_chord_change_penalty = 0.6
+    ml_chord_include_key = True
+
+    if harmony_mode == "ml":
+        ml_chord_model_path = st.text_input("Chord model path", value="data/ml/chord_model.pt")
+        ml_chord_change_penalty = st.slider("Chord smoothing (change penalty)", 0.0, 2.0, 0.6, 0.05)
+        ml_chord_include_key = st.toggle("Chord model uses key features", value=True)
+
+
     st.markdown("</div>", unsafe_allow_html=True)
 
     generate_btn = st.button("✨ Generate backing track", use_container_width=True, disabled=(uploaded is None))
@@ -200,6 +214,10 @@ def run_pipeline(
     jitter_ms: float,
     vel_jitter: int,
     swing: float,
+    harmony_mode: str,
+    ml_chord_model_path: str,
+    ml_chord_change_penalty: float,
+    ml_chord_include_key: bool,
 ) -> tuple[Path, dict]:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as f:
         f.write(midi_bytes)
@@ -244,14 +262,25 @@ def run_pipeline(
     raw_key = estimate_key(melody_notes)
     key = apply_mood_to_key(raw_key, mood)
 
-    chords = generate_chords(
-        key=key,
-        grid=grid,
-        duration_seconds=info.duration,
-        mood=mood,
-        melody_notes=melody_notes,
-        bars_per_chord=bars_per_chord,
-    )
+    if harmony_mode == "ml":
+        chords = predict_chords_ml(
+            melody_notes=melody_notes,
+            grid=grid,
+            duration_seconds=info.duration,
+            model_path=ml_chord_model_path,
+            include_key=ml_chord_include_key,
+            change_penalty=ml_chord_change_penalty,
+        )
+    else:
+        chords = generate_chords(
+            key=key,
+            grid=grid,
+            duration_seconds=info.duration,
+            mood=mood,
+            melody_notes=melody_notes,
+            bars_per_chord=bars_per_chord,
+        )
+
 
     arrangement = arrange_backing(
         chords=chords,
@@ -402,6 +431,11 @@ if generate_btn and uploaded is not None:
                     jitter_ms=jitter_ms,
                     vel_jitter=int(vel_jitter),
                     swing=float(swing),
+                    harmony_mode=harmony_mode,
+                    ml_chord_model_path=ml_chord_model_path,
+                    ml_chord_change_penalty=ml_chord_change_penalty,
+                    ml_chord_include_key=ml_chord_include_key,
+
                 )
         except Exception as e:
             st.error(f"Generation failed: {e}")

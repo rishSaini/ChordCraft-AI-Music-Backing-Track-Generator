@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .ml_harmony.infer import predict_chords_ml
+
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +63,10 @@ def generate(
     structure: str = typer.Option("none", "--structure", help="Song structure: none | auto"),
     drums_mode: str = typer.Option("rules", "--drums-mode", help="Drums: rules | ml"),
     ml_temp: float = typer.Option(1.05, "--ml-temp", help="ML drum temperature (if drums_mode=ml)"),
+    harmony_mode: str = typer.Option("baseline", "--harmony-mode", help="Harmony: baseline | ml"),
+    chord_model: str = typer.Option("data/ml/chord_model.pt", "--chord-model", help="ML chord model path"),
+    chord_change_penalty: float = typer.Option(0.6, "--chord-change-penalty", help="Smoothing penalty for chord changes"),
+    chord_include_key: bool = typer.Option(True, "--chord-include-key/--no-chord-include-key", help="Model expects key features"),
 ):
     # Load + auto-pick melody for baseline metadata/grid
     requested = _parse_indices(melody_tracks)
@@ -150,15 +156,26 @@ def generate(
     if key != raw_key:
         typer.echo(f"After mood '{mood_preset.name}' bias: {key_to_string(key)}")
 
-    chords = generate_chords(
-        key=key,
-        grid=grid,
-        duration_seconds=info.duration,
-        mood=mood_preset,
-        melody_notes=melody_notes,
-        bars_per_chord=bars_per_chord,
-    )
-    typer.echo(f"Chords generated: {len(chords)} (bars_per_chord={bars_per_chord})")
+    if harmony_mode == "ml":
+        chords = predict_chords_ml(
+            melody_notes=melody_notes,
+            grid=grid,
+            duration_seconds=info.duration,
+            model_path=chord_model,
+            include_key=chord_include_key,
+            change_penalty=chord_change_penalty,
+        )
+        typer.echo(f"Chords (ML) generated: {len(chords)}")
+    else:
+        chords = generate_chords(
+            key=key,
+            grid=grid,
+            duration_seconds=info.duration,
+            mood=mood_preset,
+            melody_notes=melody_notes,
+            bars_per_chord=bars_per_chord,
+        )
+        typer.echo(f"Chords (baseline) generated: {len(chords)} (bars_per_chord={bars_per_chord})")
 
     arrangement = arrange_backing(
         chords=chords,
