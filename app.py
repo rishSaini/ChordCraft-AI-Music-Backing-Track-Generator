@@ -1,18 +1,16 @@
 # app.py
 from __future__ import annotations
 
-import inspect
+import hashlib
 import tempfile
-from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional
 
-import numpy as np
 import pretty_midi
 import streamlit as st
 
-from backingtrack.arrange import Arrangement, arrange_backing
-from backingtrack.harmony_baseline import ChordEvent, generate_chords
+from backingtrack.arrange import arrange_backing
+from backingtrack.harmony_baseline import generate_chords
 from backingtrack.ml_harmony.steps_infer import ChordSampleConfig, generate_chords_ml_steps
 from backingtrack.humanize import HumanizeConfig, humanize_arrangement
 from backingtrack.key_detect import estimate_key, key_to_string
@@ -20,7 +18,6 @@ from backingtrack.melody import MelodyConfig, extract_melody_notes
 from backingtrack.midi_io import load_and_prepare
 from backingtrack.moods import apply_mood_to_key, get_mood, list_moods
 from backingtrack.render import RenderConfig, write_midi
-from backingtrack.types import BarGrid, Note
 
 PC_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
@@ -98,481 +95,126 @@ def _auto_pick_with_intro(
 
 
 # ----------------------------
-# ML Bass (inlined, robust)
+# Auto settings (new)
 # ----------------------------
-QUAL_VOCAB_DEFAULT = ["N", "maj", "min", "7", "maj7", "min7", "dim", "sus2", "sus4"]
+@st.cache_data(show_spinner=False)
+def recommend_settings(midi_bytes: bytes) -> Dict[str, Any]:
+    """
+    Heuristic 'auto' settings. No training required.
+    Returns a dict of session_state keys -> values.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as f:
+        f.write(midi_bytes)
+        tmp_path = Path(f.name)
 
+    pm, info, grid, melody_inst, sel = load_and_prepare(tmp_path, melody_instrument_index=None)
+    melody_source_insts, _ = _auto_pick_with_intro(pm, info, melody_inst, sel)
 
-@dataclass(frozen=True)
-class _BassCfg:
-    feat_dim: int
-    n_degree: int
-    n_register: int
-    n_rhythm: int
-    max_steps: int = 128
-    d_model: int = 128
-    n_heads: int = 4
-    n_layers: int = 4
-    dropout: float = 0.1
+    analysis_inst = pretty_midi.Instrument(program=int(melody_source_insts[0].program), is_drum=False, name="Analysis")
+    analysis_inst.notes = [n for inst in melody_source_insts for n in inst.notes]
+    analysis_inst.notes.sort(key=lambda n: (n.start, n.pitch))
 
+    melody_notes = extract_melody_notes(analysis_inst, grid=grid, config=MelodyConfig(quantize_to_beat=False))
 
-def _normalize_bass_cfg(cfg_in: Dict[str, Any]) -> Dict[str, Any]:
-    cfg = dict(cfg_in)
+    bpm = float(getattr(info, "tempo_bpm", 120.0) or 120.0)
+    dur = float(getattr(info, "duration", 0.0) or 0.0)
+    dur = max(dur, 1e-6)
+    n_notes = len(melody_notes)
+    notes_per_sec = n_notes / dur
 
-    # accept alias keys
-    if "n_degrees" in cfg and "n_degree" not in cfg:
-        cfg["n_degree"] = cfg.pop("n_degrees")
-    if "n_registers" in cfg and "n_register" not in cfg:
-        cfg["n_register"] = cfg.pop("n_registers")
-    if "n_rhythms" in cfg and "n_rhythm" not in cfg:
-        cfg["n_rhythm"] = cfg.pop("n_rhythms")
+    fast = bpm >= 150.0
+    slow = bpm <= 85.0
+    dense = notes_per_sec >= 3.0 or n_notes >= 450
+    sparse = notes_per_sec <= 1.2 and n_notes <= 140
 
-    if "max_len" in cfg and "max_steps" not in cfg:
-        cfg["max_steps"] = cfg.pop("max_len")
-    if "seq_len" in cfg and "max_steps" not in cfg:
-        cfg["max_steps"] = cfg.pop("seq_len")
+    ts = getattr(info, "time_signature", None)
+    is_44 = True
+    if ts is not None:
+        is_44 = (getattr(ts, "numerator", 4) == 4) and (getattr(ts, "denominator", 4) == 4)
 
-    allowed = {f.name for f in fields(_BassCfg)}
-    return {k: v for k, v in cfg.items() if k in allowed}
+    # chords
+    harmony_mode = "baseline (rules)" if (dense or fast) else "ml (transformer)"
+    bars_per_chord = 2 if slow else 1
 
+    chord_step_beats = 4.0 if slow else 2.0
+    chord_include_key = True
+    chord_stochastic = bool(sparse and not fast)
 
-def _build_causal_mask(T: int, device) -> Any:
-    import torch
-    return torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=1)
+    chord_temp = 1.0
+    chord_top_k = 12
+    if sparse:
+        chord_temp = 1.15
+        chord_top_k = 18
+    elif dense:
+        chord_temp = 0.95
+        chord_top_k = 10
 
+    chord_repeat_penalty = 1.2
+    chord_change_penalty = 0.15
+    if sparse:
+        chord_repeat_penalty = 1.25
+        chord_change_penalty = 0.10
+    elif dense:
+        chord_repeat_penalty = 1.15
+        chord_change_penalty = 0.22
 
-class _BassTransformer:
-    # minimal wrapper so we can lazy-import torch only when needed
-    def __init__(self, cfg: _BassCfg):
-        import torch.nn as nn
-
-        self.cfg = cfg
-        self.net = nn.Module()  # placeholder to attach submodules (state_dict compatible)
-        self.net.in_proj = nn.Linear(cfg.feat_dim, cfg.d_model)
-        self.net.pos = nn.Embedding(cfg.max_steps, cfg.d_model)
-
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
-            nhead=cfg.n_heads,
-            dim_feedforward=cfg.d_model * 4,
-            dropout=cfg.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.net.enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.n_layers)
-        self.net.ln = nn.LayerNorm(cfg.d_model)
-
-        self.net.head_degree = nn.Linear(cfg.d_model, cfg.n_degree)
-        self.net.head_register = nn.Linear(cfg.d_model, cfg.n_register)
-        self.net.head_rhythm = nn.Linear(cfg.d_model, cfg.n_rhythm)
-
-    def to(self, device):
-        self.net.to(device)
-        return self
-
-    def eval(self):
-        self.net.eval()
-        return self
-
-    def load_state_dict(self, sd):
-        self.net.load_state_dict(sd)
-
-    def __call__(self, x, attn_mask=None):
-        import torch
-
-        B, T, _ = x.shape
-        device = x.device
-
-        h = self.net.in_proj(x)
-        idx = torch.arange(T, device=device)
-        h = h + self.net.pos(idx)[None, :, :]
-
-        causal = _build_causal_mask(T, device=device)
-
-        pad_mask = None
-        if attn_mask is not None:
-            pad_mask = ~attn_mask  # transformer expects True where padding
-
-        h = self.net.enc(h, mask=causal, src_key_padding_mask=pad_mask)
-        h = self.net.ln(h)
-
-        deg = self.net.head_degree(h)
-        reg = self.net.head_register(h)
-        rhy = self.net.head_rhythm(h)
-        return deg, reg, rhy
-
-
-def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
-    return max(0.0, min(a1, b1) - max(a0, b0))
-
-
-def _mel_step_feat(melody: Sequence[Note], t0: float, t1: float, step_len: float) -> np.ndarray:
-    hist = np.zeros(12, dtype=np.float32)
-    tot = 0.0
-    pitch_num = 0.0
-    for n in melody:
-        ov = _overlap(float(n.start), float(n.end), t0, t1)
-        if ov <= 0:
-            continue
-        tot += ov
-        hist[int(n.pitch) % 12] += float(ov)
-        pitch_num += float(ov) * float(n.pitch)
-
-    if hist.sum() > 1e-9:
-        hist = hist / (hist.sum() + 1e-9)
-
-    mean_pitch = (pitch_num / max(1e-9, tot)) if tot > 0 else 60.0
-    mean_pitch_norm = float(np.clip(mean_pitch / 127.0, 0.0, 1.0))
-    activity = float(np.clip(tot / max(1e-9, step_len), 0.0, 1.0))
-    return np.concatenate([hist, np.array([mean_pitch_norm, activity], dtype=np.float32)], axis=0)
-
-
-def _key_feat(melody: Sequence[Note]) -> np.ndarray:
-    k = estimate_key(list(melody))
-    tonic = int(k.tonic_pc) % 12
-    tonic_oh = np.zeros(12, dtype=np.float32)
-    tonic_oh[tonic] = 1.0
-    mode_oh = np.zeros(2, dtype=np.float32)
-    mode_oh[0 if k.mode == "major" else 1] = 1.0
-    return np.concatenate([tonic_oh, mode_oh], axis=0).astype(np.float32)
-
-
-def _normalize_quality(q: str) -> str:
-    q = (q or "").strip().lower()
-    if q in ("n", "none", "no_chord", "nochord"):
-        return "N"
-    if q in ("major",):
-        return "maj"
-    if q in ("minor", "m"):
-        return "min"
-    if q in ("dom7", "dominant7", "9", "11", "13"):
-        return "7"
-    if q in ("major7", "maj9"):
-        return "maj7"
-    if q in ("minor7", "m7", "min9"):
-        return "min7"
-    if "sus2" in q:
-        return "sus2"
-    if "sus4" in q or q == "sus":
-        return "sus4"
-    if "dim" in q:
-        return "dim"
-    if q in ("maj", "min", "7", "maj7", "min7", "sus2", "sus4", "dim"):
-        return q
-    return "maj"
-
-
-def _chord_at(chords: Sequence[ChordEvent], t: float) -> ChordEvent:
-    for c in chords:
-        if float(c.start) <= t < float(c.end):
-            return c
-    return chords[-1]
-
-
-def _chord_feat(ch: ChordEvent, qual_vocab: list[str]) -> np.ndarray:
-    root_oh = np.zeros(12, dtype=np.float32)
-    root_oh[int(ch.root_pc) % 12] = 1.0
-
-    q = _normalize_quality(str(ch.quality))
-    qual_to_i = {qq: i for i, qq in enumerate(qual_vocab)}
-    qual_oh = np.zeros(len(qual_vocab), dtype=np.float32)
-    qual_oh[qual_to_i.get(q, qual_to_i.get("N", 0))] = 1.0
-    return np.concatenate([root_oh, qual_oh], axis=0).astype(np.float32)
-
-
-def _pos_feat(t0: float, spb: float, pos_bins: int) -> np.ndarray:
-    beats = (t0 / max(1e-9, spb)) % 4.0
-    idx = int(np.floor(beats / (4.0 / float(pos_bins)))) % pos_bins
-    oh = np.zeros(pos_bins, dtype=np.float32)
-    oh[idx] = 1.0
-    return oh
-
-
-def _sample_id(logits: np.ndarray, temperature: float, top_k: int, rng: np.random.Generator) -> int:
-    if temperature <= 0:
-        return int(np.argmax(logits))
-    x = logits.astype(np.float64) / max(1e-9, float(temperature))
-    if top_k and 0 < top_k < x.shape[0]:
-        idx = np.argpartition(x, -top_k)[-top_k:]
-        mask = np.full_like(x, -1e18)
-        mask[idx] = x[idx]
-        x = mask
-    x = x - np.max(x)
-    p = np.exp(x)
-    p = p / (np.sum(p) + 1e-12)
-    return int(rng.choice(np.arange(len(p)), p=p))
-
-
-def _chord_pcs(root_pc: int, quality: str, extensions: Tuple[int, ...]) -> Tuple[int, ...]:
-    q = _normalize_quality(quality)
-    r = int(root_pc) % 12
-    if q == "maj":
-        ivs = (0, 4, 7)
-    elif q == "min":
-        ivs = (0, 3, 7)
-    elif q == "dim":
-        ivs = (0, 3, 6)
-    elif q == "sus2":
-        ivs = (0, 2, 7)
-    elif q == "sus4":
-        ivs = (0, 5, 7)
-    elif q == "7":
-        ivs = (0, 4, 7, 10)
-    elif q == "maj7":
-        ivs = (0, 4, 7, 11)
-    elif q == "min7":
-        ivs = (0, 3, 7, 10)
+    # drums
+    if (not is_44) or dense or fast:
+        drums_mode = "rules"
+        ml_temp = 1.05
     else:
-        ivs = (0, 4, 7)
+        drums_mode = "ml"
+        ml_temp = 1.00 if not sparse else 1.05
 
-    pcs = [(r + iv) % 12 for iv in ivs]
-    pcs += [(r + int(iv)) % 12 for iv in extensions]
-    out: List[int] = []
-    for pc in pcs:
-        if pc not in out:
-            out.append(int(pc))
-    return tuple(out)
+    # melody preprocessing
+    quantize_melody = bool(dense and bpm >= 110.0)
 
+    # humanize
+    humanize = True
+    jitter_ms = 10.0 if fast else (18.0 if slow else 15.0)
+    vel_jitter = 6 if fast else (10 if slow else 8)
+    swing = 0.08 if fast else (0.18 if slow else 0.12)
 
-def _pc_to_pitch(pc: int, register_id: int, n_register: int) -> int:
-    if n_register <= 1:
-        center = 50
-    else:
-        centers = [40, 50, 60]
-        center = centers[int(np.clip(register_id, 0, len(centers) - 1))]
-    best = None
-    best_dist = 1e9
-    for pitch in range(24, 84):
-        if pitch % 12 != (pc % 12):
-            continue
-        dist = abs(pitch - center)
-        if dist < best_dist:
-            best_dist = dist
-            best = pitch
-    return int(best if best is not None else center)
-
-
-def _render_step(
-    t0: float,
-    step_len: float,
-    degree_id: int,
-    register_id: int,
-    rhythm_id: int,
-    chord: ChordEvent,
-    velocity: int,
-    n_degree: int,
-    n_rhythm: int,
-) -> List[Note]:
-    # rhythm handling:
-    # - if n_rhythm==2: 0 rest, 1 hit
-    # - if n_rhythm>=5: 0 REST, 1 SUSTAIN, 2 HIT_ON, 3 HIT_OFF, 4 MULTI
-    if n_rhythm == 2:
-        if rhythm_id == 0:
-            return []
-        rhythm_mode = "HIT_ON"
-    else:
-        if rhythm_id == 0:
-            return []
-        rhythm_mode = {1: "SUSTAIN", 2: "HIT_ON", 3: "HIT_OFF", 4: "MULTI"}.get(rhythm_id, "HIT_ON")
-
-    pcs = _chord_pcs(int(chord.root_pc), str(chord.quality), tuple(getattr(chord, "extensions", ()) or ()))
-    if not pcs:
-        return []
-
-    root = int(chord.root_pc) % 12
-
-    # degree handling (assumes 0=REST if present)
-    if n_degree >= 7:
-        # 0 REST, 1 ROOT, 2 THIRD, 3 FIFTH, 4 SEVENTH, 5 CHORD_TONE, 6 NONCHORD
-        if degree_id == 0:
-            return []
-        if degree_id == 1:
-            pc = root
-        elif degree_id == 2:
-            pc = pcs[1] if len(pcs) >= 2 else root
-        elif degree_id == 3:
-            pc = pcs[2] if len(pcs) >= 3 else root
-        elif degree_id == 4:
-            pc = pcs[3] if len(pcs) >= 4 else root
-        elif degree_id == 5:
-            cand = [p for p in pcs if p != root]
-            pc = cand[0] if cand else root
-        else:
-            pc = (root + 1) % 12
-    else:
-        # fallback: treat any nonzero degree as root-ish
-        if degree_id == 0:
-            return []
-        pc = root
-
-    pitch = _pc_to_pitch(pc, int(register_id), n_register=3)
-
-    if rhythm_mode in ("SUSTAIN", "HIT_ON"):
-        return [Note(pitch=pitch, start=t0, end=t0 + step_len * 0.92, velocity=velocity)]
-    if rhythm_mode == "HIT_OFF":
-        return [Note(pitch=pitch, start=t0 + 0.5 * step_len, end=t0 + step_len * 0.98, velocity=velocity)]
-    if rhythm_mode == "MULTI":
-        return [
-            Note(pitch=pitch, start=t0, end=t0 + 0.5 * step_len, velocity=velocity),
-            Note(pitch=pitch, start=t0 + 0.5 * step_len, end=t0 + step_len * 0.98, velocity=velocity),
-        ]
-    return []
+    return {
+        "harmony_mode": harmony_mode,
+        "bars_per_chord": int(bars_per_chord),
+        "chord_model_path": "data/ml/chord_model_new.pt",
+        "chord_step_beats": float(chord_step_beats),
+        "chord_include_key": bool(chord_include_key),
+        "chord_stochastic": bool(chord_stochastic),
+        "chord_temp": float(chord_temp),
+        "chord_top_k": int(chord_top_k),
+        "chord_repeat_penalty": float(chord_repeat_penalty),
+        "chord_change_penalty": float(chord_change_penalty),
+        "quantize_melody": bool(quantize_melody),
+        "drums_mode": str(drums_mode),
+        "ml_temp": float(ml_temp),
+        "humanize": bool(humanize),
+        "jitter_ms": float(jitter_ms),
+        "vel_jitter": int(vel_jitter),
+        "swing": float(swing),
+        "auto_sections": True,
+    }
 
 
-@st.cache_resource(show_spinner=False)
-def _load_bass_model_cached(model_path: str):
-    import torch
-
-    p = Path(model_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Bass model not found: {p}")
-
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(str(p), map_location=dev)
-
-    cfg_dict = _normalize_bass_cfg(dict(ckpt["cfg"]))
-    cfg = _BassCfg(**cfg_dict)
-
-    model = _BassTransformer(cfg).to(dev)
-    model.load_state_dict(ckpt["state"])
-    model.eval()
-
-    meta = ckpt.get("meta", {}) or {}
-    return model, cfg, dev, meta
-
-
-def generate_bass_ml(
-    *,
-    model_path: str,
-    melody_notes: List[Note],
-    chords: List[ChordEvent],
-    grid: BarGrid,
-    duration_seconds: float,
-    include_key: bool,
-    step_beats: float,
-    temperature: float,
-    top_k: int,
-    seed: Optional[int],
-    velocity: int,
-) -> List[Note]:
-    model, cfg, dev, meta = _load_bass_model_cached(model_path)
-
-    qual_vocab = list(meta.get("qual_vocab") or QUAL_VOCAB_DEFAULT)
-
-    spb = float(grid.seconds_per_beat)
-    step_len = max(1e-6, float(step_beats) * spb)
-    n_steps = int(np.ceil(max(1e-6, float(duration_seconds)) / step_len))
-
-    # Choose pos_bins to match feat_dim (try a few common options)
-    mel_dim = 14
-    key_dim = 14 if include_key else 0
-    chord_dim = 12 + len(qual_vocab)
-
-    pos_bins_candidates = [2, 4, 1, 8]
-    pos_bins = None
-    for b in pos_bins_candidates:
-        if mel_dim + key_dim + chord_dim + b == int(cfg.feat_dim):
-            pos_bins = b
-            break
-    if pos_bins is None:
-        raise ValueError(
-            f"Bass feat_dim mismatch. Model expects feat_dim={cfg.feat_dim}, "
-            f"but schema gives {mel_dim}+{key_dim}+{chord_dim}+pos_bins.\n"
-            f"Try toggling include_key or retrain bass with the same features. "
-            f"(qual_vocab_len={len(qual_vocab)})"
-        )
-
-    kfeat = _key_feat(melody_notes) if include_key else None
-
-    X = np.zeros((n_steps, int(cfg.feat_dim)), dtype=np.float32)
-    for i in range(n_steps):
-        t0 = float(i) * step_len
-        t1 = t0 + step_len
-        mfeat = _mel_step_feat(melody_notes, t0, t1, step_len)
-        ch = _chord_at(chords, t0 + 1e-4)
-        cfeat = _chord_feat(ch, qual_vocab=qual_vocab)
-        pfeat = _pos_feat(t0, spb, pos_bins=pos_bins)
-
-        if kfeat is not None:
-            x = np.concatenate([mfeat, kfeat, cfeat, pfeat], axis=0).astype(np.float32)
-        else:
-            x = np.concatenate([mfeat, cfeat, pfeat], axis=0).astype(np.float32)
-        X[i] = x
-
-    import torch
-
-    rng = np.random.default_rng(seed if seed is not None else None)
-
-    T = X.shape[0]
-    max_steps = int(cfg.max_steps)
-
-    out_notes: List[Note] = []
-
-    start = 0
-    while start < T:
-        end = min(T, start + max_steps)
-        chunk = X[start:end]
-        keep = end - start
-
-        x_in = np.zeros((max_steps, X.shape[1]), dtype=np.float32)
-        attn = np.zeros((max_steps,), dtype=np.bool_)
-        x_in[:keep] = chunk
-        attn[:keep] = True
-
-        xb = torch.tensor(x_in[None, :, :], dtype=torch.float32, device=dev)
-        attb = torch.tensor(attn[None, :], dtype=torch.bool, device=dev)
-
-        with torch.no_grad():
-            deg_logits, reg_logits, rhy_logits = model(xb, attn_mask=attb)
-            deg_logits = deg_logits[0, :keep].detach().cpu().numpy()
-            reg_logits = reg_logits[0, :keep].detach().cpu().numpy()
-            rhy_logits = rhy_logits[0, :keep].detach().cpu().numpy()
-
-        for j in range(keep):
-            step_idx = start + j
-            t0 = float(step_idx) * step_len
-            if t0 >= float(duration_seconds):
-                break
-
-            ch = _chord_at(chords, t0 + 1e-4)
-
-            deg_id = _sample_id(deg_logits[j], temperature=float(temperature), top_k=int(top_k), rng=rng)
-            reg_id = int(np.argmax(reg_logits[j]))
-            rhy_id = _sample_id(rhy_logits[j], temperature=float(temperature), top_k=int(top_k), rng=rng)
-
-            out_notes.extend(
-                _render_step(
-                    t0=t0,
-                    step_len=step_len,
-                    degree_id=int(deg_id),
-                    register_id=int(reg_id),
-                    rhythm_id=int(rhy_id),
-                    chord=ch,
-                    velocity=int(velocity),
-                    n_degree=int(cfg.n_degree),
-                    n_rhythm=int(cfg.n_rhythm),
-                )
-            )
-
-        start = end
-
-    # safe-sort
-    out_notes.sort(key=lambda n: (n.start, n.pitch))
-    return out_notes
+def _apply_auto_settings(reco: Dict[str, Any], *, file_sig: str, force: bool = False) -> None:
+    last_sig = st.session_state.get("_auto_sig")
+    if force or (last_sig != file_sig):
+        st.session_state["_auto_sig"] = file_sig
+        for k, v in reco.items():
+            st.session_state[k] = v
 
 
 # ----------------------------
-# Streamlit UI
+# UI
 # ----------------------------
-st.set_page_config(page_title="AI Backing Track Maker", page_icon="🎼", layout="wide")
+st.set_page_config(page_title="AI Backing Track Maker", layout="wide")
 
 st.markdown(
     """
     <style>
-      .block-container { padding-top: 1.2rem; max-width: 1200px; }
-      .stButton>button { border-radius: 14px; padding: 0.75rem 1.1rem; font-weight: 650; }
-      .card { border: 1px solid rgba(255,255,255,0.10); border-radius: 18px; padding: 16px 18px; background: rgba(255,255,255,0.04); }
+      .card { border: 1px solid rgba(255,255,255,0.08); border-radius: 14px;
+              padding: 16px 18px; background: rgba(255,255,255,0.04); }
       .muted { opacity: 0.75; }
       code { font-size: 0.95em; }
     </style>
@@ -585,6 +227,37 @@ st.caption("Upload a MIDI melody → generate a backing track (bass/pad/drums) �
 
 left, right = st.columns([0.42, 0.58], gap="large")
 
+# Session defaults
+DEFAULTS: Dict[str, Any] = {
+    "mood_name": "neutral",
+    "auto_settings": True,
+    "harmony_mode": "baseline (rules)",
+    "bars_per_chord": 1,
+    "chord_model_path": "data/ml/chord_model_new.pt",
+    "chord_step_beats": 2.0,
+    "chord_include_key": True,
+    "chord_stochastic": False,
+    "chord_temp": 1.0,
+    "chord_top_k": 12,
+    "chord_repeat_penalty": 1.2,
+    "chord_change_penalty": 0.15,
+    "quantize_melody": False,
+    "drums_mode": "rules",
+    "ml_temp": 1.05,
+    "humanize": True,
+    "jitter_ms": 15.0,
+    "vel_jitter": 8,
+    "swing": 0.15,
+    "use_seed": False,
+    "seed_value": 0,
+    "auto_sections": True,
+    "make_bass": True,
+    "make_pad": True,
+    "make_drums": True,
+}
+for k, v in DEFAULTS.items():
+    st.session_state.setdefault(k, v)
+
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("1) Upload MIDI")
@@ -595,82 +268,119 @@ with left:
     st.subheader("2) Controls")
 
     moods = list_moods()
-    mood_name = st.selectbox("Mood", moods, index=moods.index("neutral") if "neutral" in moods else 0)
+    mood_name = st.selectbox(
+        "Mood",
+        moods,
+        index=moods.index(st.session_state["mood_name"]) if st.session_state["mood_name"] in moods else 0,
+        key="mood_name",
+    )
 
-    st.markdown("**Harmony (chords)**")
-    harmony_mode = st.selectbox("Chord generator", ["baseline (rules)", "ml (transformer)"], index=0)
+    auto_settings = st.toggle(
+        "Auto choose settings",
+        value=bool(st.session_state["auto_settings"]),
+        key="auto_settings",
+        help="Picks good defaults for this MIDI. You can override anything in Advanced controls.",
+    )
 
-    # chord defaults
-    chord_model_path = "data/ml/chord_model_new.pt"
-    chord_step_beats = 2.0
-    chord_include_key = True
-    chord_stochastic = False
-    chord_temp = 1.0
-    chord_top_k = 12
-    chord_repeat_penalty = 1.2
-    chord_change_penalty = 0.15
+    if uploaded is not None and auto_settings:
+        midi_bytes = uploaded.getvalue()
+        file_sig = hashlib.sha1(midi_bytes).hexdigest()
+        reco = recommend_settings(midi_bytes)
 
-    if harmony_mode.startswith("ml"):
-        chord_model_path = st.text_input("Chord model path", value=chord_model_path)
-        chord_step_beats = float(st.selectbox("Chord step size (beats)", [1.0, 2.0, 4.0], index=1))
-        chord_include_key = st.toggle("Include key features (recommended)", value=True)
+        c1, c2 = st.columns([0.62, 0.38])
+        with c1:
+            st.caption(
+                f"Auto: chords={reco['harmony_mode']} · drums={reco['drums_mode']} · quantize={'on' if reco['quantize_melody'] else 'off'}"
+            )
+        with c2:
+            reapply = st.button("Re-apply auto", use_container_width=True)
 
-        chord_stochastic = st.toggle("Stochastic chords (more variety)", value=False)
-        chord_temp = st.slider("Chord temperature", 0.7, 1.6, 1.0, 0.01)
-        chord_top_k = st.slider("Chord top-k (0 = no top-k)", 0, 40, 12, 1)
-        chord_repeat_penalty = st.slider("Chord repeat penalty", 0.0, 3.0, 1.2, 0.05)
-        chord_change_penalty = st.slider(
-            "Chord smoothness (change penalty)",
-            0.0,
-            0.6,
-            0.15,
-            0.01,
-            disabled=chord_stochastic,
-        )
-        bars_per_chord = st.slider("Bars per chord (baseline only)", 1, 4, 1, 1, disabled=True)
-    else:
-        bars_per_chord = st.slider("Bars per chord", 1, 4, 1, 1)
+        _apply_auto_settings(reco, file_sig=file_sig, force=bool(reapply))
 
-    quantize_melody = st.toggle("Quantize melody to beat grid", value=False)
+    # Simple surface controls
+    auto_sections = st.toggle(
+        "Auto song sections (intro/verse/chorus/outro)",
+        value=bool(st.session_state["auto_sections"]),
+        key="auto_sections",
+    )
+    structure_mode = "auto" if auto_sections else "none"
 
-    st.divider()
-    st.markdown("**Humanize**")
-    humanize = st.toggle("Humanize timing/velocity", value=True)
-    jitter_ms = st.slider("Timing jitter (ms)", 0.0, 35.0, 15.0, 1.0)
-    vel_jitter = st.slider("Velocity jitter", 0, 20, 8, 1)
-    swing = st.slider("Swing (0..1)", 0.0, 0.6, 0.15, 0.01)
-
-    seed_value = st.number_input("Seed (optional)", value=0, step=1)
-    use_seed = st.toggle("Use seed", value=False)
-    seed: Optional[int] = int(seed_value) if use_seed else None
-
-    structure_mode = "auto" if st.toggle("Auto song sections (intro/verse/chorus/outro)", value=True) else "none"
-
-    st.divider()
     st.markdown("**Backing tracks**")
-    make_bass = st.toggle("Bass", value=True)
-    make_pad = st.toggle("Pad", value=True)
-    make_drums = st.toggle("Drums", value=True)
+    make_bass = st.toggle("Bass (rules)", value=bool(st.session_state["make_bass"]), key="make_bass")
+    make_pad = st.toggle("Pad", value=bool(st.session_state["make_pad"]), key="make_pad")
+    make_drums = st.toggle("Drums", value=bool(st.session_state["make_drums"]), key="make_drums")
 
-    # NEW: bass mode + controls
-    bass_mode = st.selectbox("Bass generator", ["rules", "ml"], index=1 if make_bass else 0, disabled=not make_bass)
-    bass_model_path = "data/ml/bass_model.pt"
-    bass_step_beats = 2.0
-    bass_include_key = True
-    bass_temp = 0.0
-    bass_top_k = 0
-    bass_velocity = 90
+    with st.expander("Advanced controls", expanded=False):
+        st.markdown("**Harmony (chords)**")
+        harmony_mode = st.selectbox(
+            "Chord generator",
+            ["baseline (rules)", "ml (transformer)"],
+            index=["baseline (rules)", "ml (transformer)"].index(st.session_state["harmony_mode"])
+            if st.session_state["harmony_mode"] in ["baseline (rules)", "ml (transformer)"]
+            else 0,
+            key="harmony_mode",
+        )
 
-    if make_bass and bass_mode == "ml":
-        bass_model_path = st.text_input("Bass model path", value=bass_model_path)
-        bass_step_beats = float(st.selectbox("Bass step size (beats)", [1.0, 2.0, 4.0], index=1))
-        bass_include_key = st.toggle("Bass include key features", value=True)
-        bass_temp = st.slider("Bass temperature (0 = greedy)", 0.0, 1.6, 0.0, 0.01)
-        bass_top_k = st.slider("Bass top-k (0 = off)", 0, 40, 0, 1)
-        bass_velocity = st.slider("Bass velocity", 40, 120, 90, 1)
+        if str(harmony_mode).startswith("ml"):
+            st.text_input("Chord model path", value=str(st.session_state["chord_model_path"]), key="chord_model_path")
+            st.selectbox(
+                "Chord step size (beats)",
+                [1.0, 2.0, 4.0],
+                index=[1.0, 2.0, 4.0].index(float(st.session_state["chord_step_beats"]))
+                if float(st.session_state["chord_step_beats"]) in [1.0, 2.0, 4.0]
+                else 1,
+                key="chord_step_beats",
+            )
+            st.toggle("Include key features (recommended)", value=bool(st.session_state["chord_include_key"]), key="chord_include_key")
+            st.toggle("Stochastic chords (more variety)", value=bool(st.session_state["chord_stochastic"]), key="chord_stochastic")
+            st.slider("Chord temperature", 0.7, 1.6, float(st.session_state["chord_temp"]), 0.01, key="chord_temp")
+            st.slider("Chord top-k (0 = no top-k)", 0, 40, int(st.session_state["chord_top_k"]), 1, key="chord_top_k")
+            st.slider("Chord repeat penalty", 0.0, 3.0, float(st.session_state["chord_repeat_penalty"]), 0.05, key="chord_repeat_penalty")
+            st.slider(
+                "Chord smoothness (change penalty)",
+                0.0,
+                0.6,
+                float(st.session_state["chord_change_penalty"]),
+                0.01,
+                key="chord_change_penalty",
+                disabled=bool(st.session_state["chord_stochastic"]),
+            )
+            st.slider("Bars per chord (baseline only)", 1, 4, int(st.session_state["bars_per_chord"]), 1, key="bars_per_chord", disabled=True)
+        else:
+            st.slider("Bars per chord", 1, 4, int(st.session_state["bars_per_chord"]), 1, key="bars_per_chord")
 
-    drums_mode = st.selectbox("Drums", ["rules", "ml"], index=0)
-    ml_temp = st.slider("ML drum temperature", 0.8, 1.4, 1.05, 0.01)
+        st.markdown("**Melody preprocessing**")
+        st.toggle("Quantize melody to beat grid", value=bool(st.session_state["quantize_melody"]), key="quantize_melody")
+
+        st.divider()
+        st.markdown("**Drums**")
+        st.selectbox(
+            "Drums generator",
+            ["rules", "ml"],
+            index=["rules", "ml"].index(st.session_state["drums_mode"]) if st.session_state["drums_mode"] in ["rules", "ml"] else 0,
+            key="drums_mode",
+        )
+        st.slider(
+            "ML drum temperature",
+            0.8,
+            1.4,
+            float(st.session_state["ml_temp"]),
+            0.01,
+            key="ml_temp",
+            disabled=(st.session_state["drums_mode"] != "ml"),
+        )
+
+        st.divider()
+        st.markdown("**Humanize**")
+        st.toggle("Humanize timing/velocity", value=bool(st.session_state["humanize"]), key="humanize")
+        st.slider("Timing jitter (ms)", 0.0, 35.0, float(st.session_state["jitter_ms"]), 1.0, key="jitter_ms", disabled=not bool(st.session_state["humanize"]))
+        st.slider("Velocity jitter", 0, 20, int(st.session_state["vel_jitter"]), 1, key="vel_jitter", disabled=not bool(st.session_state["humanize"]))
+        st.slider("Swing (0..1)", 0.0, 0.6, float(st.session_state["swing"]), 0.01, key="swing", disabled=not bool(st.session_state["humanize"]))
+
+        st.divider()
+        st.markdown("**Seed**")
+        st.number_input("Seed value", value=int(st.session_state["seed_value"]), step=1, key="seed_value")
+        st.toggle("Use seed", value=bool(st.session_state["use_seed"]), key="use_seed")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -704,13 +414,6 @@ def run_pipeline(
     make_bass: bool,
     make_pad: bool,
     make_drums: bool,
-    bass_mode: str,
-    bass_model_path: str,
-    bass_step_beats: float,
-    bass_include_key: bool,
-    bass_temp: float,
-    bass_top_k: int,
-    bass_velocity: int,
     melody_track_indices: Optional[list[int]],
     seed: Optional[int],
     structure_mode: str,
@@ -736,22 +439,22 @@ def run_pipeline(
         valid: list[int] = []
         for i in melody_track_indices:
             if 0 <= i < len(pm.instruments):
-                valid.append(i)
-        used_melody_indices = sorted(set(valid)) if valid else [sel.instrument_index]
-        melody_source_insts = [pm.instruments[i] for i in used_melody_indices]
+                if not pm.instruments[i].is_drum:
+                    valid.append(i)
+        if not valid:
+            raise RuntimeError("No valid (non-drum) melody instruments selected.")
+        melody_source_insts = [pm.instruments[i] for i in valid]
+        used_melody_indices = valid
     else:
         melody_source_insts, picked_intro_idxs = _auto_pick_with_intro(pm, info, melody_inst, sel)
-        for i, inst in enumerate(pm.instruments):
-            if any(inst is x for x in melody_source_insts):
-                used_melody_indices.append(i)
+        used_melody_indices = [sel.instrument_index] + picked_intro_idxs
 
     # Combine selected lead instruments for analysis
     analysis_inst = pretty_midi.Instrument(program=int(melody_source_insts[0].program), is_drum=False, name="Analysis")
     analysis_inst.notes = [n for inst in melody_source_insts for n in inst.notes]
     analysis_inst.notes.sort(key=lambda n: (n.start, n.pitch))
 
-    mel_cfg = MelodyConfig(quantize_to_beat=quantize_melody)
-    melody_notes = extract_melody_notes(analysis_inst, grid=grid, config=mel_cfg)
+    melody_notes = extract_melody_notes(analysis_inst, grid=grid, config=MelodyConfig(quantize_to_beat=quantize_melody))
     if not melody_notes:
         raise RuntimeError("No melody notes extracted. Try selecting a different melody track (or multiple tracks).")
 
@@ -787,12 +490,12 @@ def run_pipeline(
             bars_per_chord=bars_per_chord,
         )
 
-    # Arrange pad/drums (and rules bass unless ML bass selected)
+    # Arrange (rules bass only)
     arrangement = arrange_backing(
         chords=chords,
         grid=grid,
         mood=mood,
-        make_bass=bool(make_bass and bass_mode != "ml"),
+        make_bass=bool(make_bass),
         make_pad=make_pad,
         make_drums=make_drums,
         seed=seed,
@@ -801,25 +504,6 @@ def run_pipeline(
         ml_drums_model_path="data/ml/drum_model.pt",
         ml_drums_temperature=ml_temp,
     )
-
-    # ML bass override (before humanize)
-    if make_bass and bass_mode == "ml":
-        bass_notes = generate_bass_ml(
-            model_path=str(bass_model_path),
-            melody_notes=melody_notes,
-            chords=list(chords),
-            grid=grid,
-            duration_seconds=float(info.duration),
-            include_key=bool(bass_include_key),
-            step_beats=float(bass_step_beats),
-            temperature=float(bass_temp),
-            top_k=int(bass_top_k),
-            seed=seed,
-            velocity=int(bass_velocity),
-        )
-        tracks = dict(arrangement.tracks)
-        tracks["bass"] = bass_notes
-        arrangement = Arrangement(tracks=tracks)
 
     if humanize:
         arrangement = humanize_arrangement(
@@ -860,12 +544,7 @@ def run_pipeline(
         "chord_top_k": int(chord_top_k),
         "chord_repeat_penalty": float(chord_repeat_penalty),
         "chord_change_penalty": float(chord_change_penalty),
-        "bass_mode": bass_mode,
-        "bass_model_path": str(bass_model_path),
-        "bass_step_beats": float(bass_step_beats),
-        "bass_include_key": bool(bass_include_key),
-        "bass_temperature": float(bass_temp),
-        "bass_top_k": int(bass_top_k),
+        "bass_mode": "rules",
         "chords": chords,
         "arrangement_counts": {k: len(v) for k, v in arrangement.tracks.items()},
         "instrument_list": [
@@ -918,17 +597,12 @@ if uploaded is not None:
                 options=options,
                 default=[default_label] if default_label else [],
             )
-            melody_track_indices = [int(x.split(":")[0].strip()) for x in picked] if picked else None
+            melody_track_indices = [int(x.split(':')[0].strip()) for x in picked] if picked else None
 
         with st.expander("Show instrument list"):
             st.json(
                 [
-                    {
-                        "idx": i,
-                        "name": (inst.name or f"Instrument {i}"),
-                        "is_drum": inst.is_drum,
-                        "notes": len(inst.notes),
-                    }
+                    {"idx": i, "name": (inst.name or f"Instrument {i}"), "is_drum": inst.is_drum, "notes": len(inst.notes)}
                     for i, inst in enumerate(pm_preview.instruments)
                 ]
             )
@@ -937,6 +611,10 @@ if uploaded is not None:
 
 
 if generate_btn and uploaded is not None:
+    # Pull values from session_state (single source of truth)
+    seed: Optional[int] = int(st.session_state["seed_value"]) if bool(st.session_state["use_seed"]) else None
+    structure_mode = "auto" if bool(st.session_state["auto_sections"]) else "none"
+
     with right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.subheader("Output")
@@ -945,37 +623,30 @@ if generate_btn and uploaded is not None:
             with st.spinner("Generating backing track..."):
                 out_path, meta = run_pipeline(
                     midi_bytes=uploaded.getvalue(),
-                    mood_name=mood_name,
-                    harmony_mode=harmony_mode,
-                    chord_model_path=chord_model_path,
-                    chord_step_beats=float(chord_step_beats),
-                    chord_include_key=bool(chord_include_key),
-                    chord_stochastic=bool(chord_stochastic),
-                    chord_temp=float(chord_temp),
-                    chord_top_k=int(chord_top_k),
-                    chord_repeat_penalty=float(chord_repeat_penalty),
-                    chord_change_penalty=float(chord_change_penalty),
-                    bars_per_chord=int(bars_per_chord),
-                    quantize_melody=quantize_melody,
-                    make_bass=make_bass,
-                    make_pad=make_pad,
-                    make_drums=make_drums,
-                    bass_mode=bass_mode,
-                    bass_model_path=bass_model_path,
-                    bass_step_beats=float(bass_step_beats),
-                    bass_include_key=bool(bass_include_key),
-                    bass_temp=float(bass_temp),
-                    bass_top_k=int(bass_top_k),
-                    bass_velocity=int(bass_velocity),
+                    mood_name=st.session_state["mood_name"],
+                    harmony_mode=st.session_state["harmony_mode"],
+                    chord_model_path=st.session_state["chord_model_path"],
+                    chord_step_beats=float(st.session_state["chord_step_beats"]),
+                    chord_include_key=bool(st.session_state["chord_include_key"]),
+                    chord_stochastic=bool(st.session_state["chord_stochastic"]),
+                    chord_temp=float(st.session_state["chord_temp"]),
+                    chord_top_k=int(st.session_state["chord_top_k"]),
+                    chord_repeat_penalty=float(st.session_state["chord_repeat_penalty"]),
+                    chord_change_penalty=float(st.session_state["chord_change_penalty"]),
+                    bars_per_chord=int(st.session_state["bars_per_chord"]),
+                    quantize_melody=bool(st.session_state["quantize_melody"]),
+                    make_bass=bool(st.session_state["make_bass"]),
+                    make_pad=bool(st.session_state["make_pad"]),
+                    make_drums=bool(st.session_state["make_drums"]),
                     melody_track_indices=melody_track_indices,
                     seed=seed,
                     structure_mode=structure_mode,
-                    drums_mode=drums_mode,
-                    ml_temp=ml_temp,
-                    humanize=humanize,
-                    jitter_ms=jitter_ms,
-                    vel_jitter=int(vel_jitter),
-                    swing=float(swing),
+                    drums_mode=st.session_state["drums_mode"],
+                    ml_temp=float(st.session_state["ml_temp"]),
+                    humanize=bool(st.session_state["humanize"]),
+                    jitter_ms=float(st.session_state["jitter_ms"]),
+                    vel_jitter=int(st.session_state["vel_jitter"]),
+                    swing=float(st.session_state["swing"]),
                 )
         except Exception as e:
             st.error(f"Generation failed: {e}")
@@ -1018,9 +689,7 @@ if generate_btn and uploaded is not None:
         st.markdown("**Chord progression preview:**")
         st.code(preview if preview else "(none)")
 
-        st.markdown(f"**Bass mode:** `{meta['bass_mode']}`")
-        if meta["bass_mode"] == "ml":
-            st.markdown(f"**Bass model:** `{meta['bass_model_path']}`")
+        st.markdown("**Bass:** `rules`")
 
         midi_out_bytes = out_path.read_bytes()
         st.download_button(

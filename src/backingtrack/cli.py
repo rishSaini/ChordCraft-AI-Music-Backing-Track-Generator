@@ -9,6 +9,9 @@ import numpy as np
 import pretty_midi
 import typer
 
+import torch
+import torch.nn as nn
+
 from .midi_io import load_and_prepare
 from .melody import MelodyConfig, extract_melody_notes
 from .key_detect import estimate_key, key_to_string
@@ -18,6 +21,7 @@ from .ml_harmony.steps_infer import ChordSampleConfig, generate_chords_ml_steps
 from .arrange import Arrangement, arrange_backing
 from .render import RenderConfig, write_midi
 from .humanize import HumanizeConfig, humanize_arrangement
+from .types import Note, BarGrid
 
 
 app = typer.Typer(add_completion=False, help="AI MIDI backing-track generator (baseline + ML modules).")
@@ -44,37 +48,46 @@ def _median_pitch(inst: pretty_midi.Instrument) -> float:
 
 
 # ----------------------------
-# ML Bass (same logic as app.py)
+# ML Bass (autoregressive LM)
 # ----------------------------
 QUAL_VOCAB_DEFAULT = ["N", "maj", "min", "7", "maj7", "min7", "dim", "sus2", "sus4"]
 
 
 @dataclass(frozen=True)
-class _BassCfg:
+class _BassARCfg:
     feat_dim: int
-    n_degree: int
-    n_register: int
-    n_rhythm: int
+    vocab_size: int
     max_steps: int = 128
-    d_model: int = 128
+
+    # decoding
+    n_degree: int = 7
+    n_register: int = 3
+    n_rhythm: int = 5
+
+    # model
+    d_model: int = 192
     n_heads: int = 4
-    n_layers: int = 4
+    n_layers: int = 6
     dropout: float = 0.1
 
 
-def _normalize_bass_cfg(cfg_in: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_bass_ar_cfg(cfg_in: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(cfg_in)
+
+    # aliases for older cfg keys
     if "n_degrees" in cfg and "n_degree" not in cfg:
         cfg["n_degree"] = cfg.pop("n_degrees")
     if "n_registers" in cfg and "n_register" not in cfg:
         cfg["n_register"] = cfg.pop("n_registers")
     if "n_rhythms" in cfg and "n_rhythm" not in cfg:
         cfg["n_rhythm"] = cfg.pop("n_rhythms")
+
     if "max_len" in cfg and "max_steps" not in cfg:
         cfg["max_steps"] = cfg.pop("max_len")
     if "seq_len" in cfg and "max_steps" not in cfg:
         cfg["max_steps"] = cfg.pop("seq_len")
-    allowed = {f.name for f in fields(_BassCfg)}
+
+    allowed = {f.name for f in fields(_BassARCfg)}
     return {k: v for k, v in cfg.items() if k in allowed}
 
 
@@ -83,10 +96,11 @@ def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
 
 
 def _mel_step_feat(melody: Sequence["Note"], t0: float, t1: float, step_len: float) -> np.ndarray:
-    from .types import Note  # local import
+    # 12-dim pitch-class histogram + mean pitch + activity
     hist = np.zeros(12, dtype=np.float32)
     tot = 0.0
     pitch_num = 0.0
+
     for n in melody:
         ov = _overlap(float(n.start), float(n.end), t0, t1)
         if ov <= 0:
@@ -94,16 +108,18 @@ def _mel_step_feat(melody: Sequence["Note"], t0: float, t1: float, step_len: flo
         tot += ov
         hist[int(n.pitch) % 12] += float(ov)
         pitch_num += float(ov) * float(n.pitch)
+
     if hist.sum() > 1e-9:
         hist = hist / (hist.sum() + 1e-9)
+
     mean_pitch = (pitch_num / max(1e-9, tot)) if tot > 0 else 60.0
     mean_pitch_norm = float(np.clip(mean_pitch / 127.0, 0.0, 1.0))
     activity = float(np.clip(tot / max(1e-9, step_len), 0.0, 1.0))
-    return np.concatenate([hist, np.array([mean_pitch_norm, activity], dtype=np.float32)], axis=0)
+
+    return np.concatenate([hist, np.array([mean_pitch_norm, activity], dtype=np.float32)], axis=0).astype(np.float32)
 
 
 def _key_feat(melody: Sequence["Note"]) -> np.ndarray:
-    from .key_detect import estimate_key
     k = estimate_key(list(melody))
     tonic = int(k.tonic_pc) % 12
     tonic_oh = np.zeros(12, dtype=np.float32)
@@ -113,29 +129,49 @@ def _key_feat(melody: Sequence["Note"]) -> np.ndarray:
     return np.concatenate([tonic_oh, mode_oh], axis=0).astype(np.float32)
 
 
+def _pos_feat(t0: float, spb: float, pos_bins: int) -> np.ndarray:
+    # position in bar one-hot
+    oh = np.zeros(pos_bins, dtype=np.float32)
+    beats = (t0 / max(1e-9, spb)) % 4.0
+    idx = int(np.floor(beats / (4.0 / pos_bins))) % pos_bins
+    oh[idx] = 1.0
+    return oh
+
+
 def _normalize_quality(q: str) -> str:
     q = (q or "").strip().lower()
     if q in ("n", "none", "no_chord", "nochord"):
         return "N"
-    if q in ("major",):
+    if q in ("", "maj", "major"):
         return "maj"
-    if q in ("minor", "m"):
+    if q in ("min", "minor", "m"):
         return "min"
-    if q in ("dom7", "dominant7", "9", "11", "13"):
+    if q in ("7", "dom7", "dominant7", "9", "11", "13"):
         return "7"
-    if q in ("major7", "maj9"):
+    if q in ("maj7", "major7", "maj9", "maj11", "maj13"):
         return "maj7"
-    if q in ("minor7", "m7", "min9"):
+    if q in ("min7", "m7", "minor7", "min9", "min11", "min13"):
         return "min7"
     if "sus2" in q:
         return "sus2"
     if "sus4" in q or q == "sus":
         return "sus4"
-    if "dim" in q:
+    if "dim" in q or "hdim" in q:
         return "dim"
-    if q in ("maj", "min", "7", "maj7", "min7", "sus2", "sus4", "dim"):
-        return q
     return "maj"
+
+
+def _chord_feat(ch: ChordEvent, *, qual_vocab: Sequence[str]) -> np.ndarray:
+    root_oh = np.zeros(12, dtype=np.float32)
+    if getattr(ch, "root_pc", None) is not None:
+        root_oh[int(ch.root_pc) % 12] = 1.0
+
+    qual_oh = np.zeros(len(qual_vocab), dtype=np.float32)
+    q = _normalize_quality(str(getattr(ch, "quality", "N")))
+    qi = qual_vocab.index(q) if q in qual_vocab else 0
+    qual_oh[int(qi)] = 1.0
+
+    return np.concatenate([root_oh, qual_oh], axis=0).astype(np.float32)
 
 
 def _chord_at(chords: Sequence[ChordEvent], t: float) -> ChordEvent:
@@ -145,75 +181,72 @@ def _chord_at(chords: Sequence[ChordEvent], t: float) -> ChordEvent:
     return chords[-1]
 
 
-def _chord_feat(ch: ChordEvent, qual_vocab: list[str]) -> np.ndarray:
-    root_oh = np.zeros(12, dtype=np.float32)
-    root_oh[int(ch.root_pc) % 12] = 1.0
-    q = _normalize_quality(str(ch.quality))
-    qual_to_i = {qq: i for i, qq in enumerate(qual_vocab)}
-    qual_oh = np.zeros(len(qual_vocab), dtype=np.float32)
-    qual_oh[qual_to_i.get(q, qual_to_i.get("N", 0))] = 1.0
-    return np.concatenate([root_oh, qual_oh], axis=0).astype(np.float32)
-
-
-def _pos_feat(t0: float, spb: float, pos_bins: int) -> np.ndarray:
-    beats = (t0 / max(1e-9, spb)) % 4.0
-    idx = int(np.floor(beats / (4.0 / float(pos_bins)))) % pos_bins
-    oh = np.zeros(pos_bins, dtype=np.float32)
-    oh[idx] = 1.0
-    return oh
-
-
 def _sample_id(logits: np.ndarray, temperature: float, top_k: int, rng: np.random.Generator) -> int:
     if temperature <= 0:
         return int(np.argmax(logits))
+
     x = logits.astype(np.float64) / max(1e-9, float(temperature))
+
     if top_k and 0 < top_k < x.shape[0]:
         idx = np.argpartition(x, -top_k)[-top_k:]
         mask = np.full_like(x, -1e18)
         mask[idx] = x[idx]
         x = mask
+
     x = x - np.max(x)
     p = np.exp(x)
     p = p / (np.sum(p) + 1e-12)
     return int(rng.choice(np.arange(len(p)), p=p))
 
 
-def _chord_pcs(root_pc: int, quality: str, extensions: Tuple[int, ...]) -> Tuple[int, ...]:
+def _chord_pcs(root_pc: int, quality: str, extensions: Tuple[str, ...]) -> List[int]:
+    # basic chord tones + a couple common extensions
     q = _normalize_quality(quality)
     r = int(root_pc) % 12
+
     if q == "maj":
-        ivs = (0, 4, 7)
+        ivs = [0, 4, 7]
     elif q == "min":
-        ivs = (0, 3, 7)
+        ivs = [0, 3, 7]
     elif q == "dim":
-        ivs = (0, 3, 6)
+        ivs = [0, 3, 6]
     elif q == "sus2":
-        ivs = (0, 2, 7)
+        ivs = [0, 2, 7]
     elif q == "sus4":
-        ivs = (0, 5, 7)
+        ivs = [0, 5, 7]
     elif q == "7":
-        ivs = (0, 4, 7, 10)
+        ivs = [0, 4, 7, 10]
     elif q == "maj7":
-        ivs = (0, 4, 7, 11)
+        ivs = [0, 4, 7, 11]
     elif q == "min7":
-        ivs = (0, 3, 7, 10)
+        ivs = [0, 3, 7, 10]
     else:
-        ivs = (0, 4, 7)
+        ivs = [0, 4, 7]
+
     pcs = [(r + iv) % 12 for iv in ivs]
-    pcs += [(r + int(iv)) % 12 for iv in extensions]
+
+    # extensions (optional)
+    exts = tuple(e.lower() for e in (extensions or ()))
+    if "9" in exts:
+        pcs.append((r + 2) % 12)
+    if "11" in exts:
+        pcs.append((r + 5) % 12)
+    if "13" in exts:
+        pcs.append((r + 9) % 12)
+
+    # unique preserve order
     out: List[int] = []
     for pc in pcs:
+        pc = int(pc)
         if pc not in out:
-            out.append(int(pc))
-    return tuple(out)
+            out.append(pc)
+    return out
 
 
-def _pc_to_pitch(pc: int, register_id: int, n_register: int) -> int:
-    if n_register <= 1:
-        center = 50
-    else:
-        centers = [40, 50, 60]
-        center = centers[int(np.clip(register_id, 0, len(centers) - 1))]
+def _pc_to_pitch(pc: int, register_id: int) -> int:
+    # register bins assumed ~3 (LOW/MID/HIGH)
+    centers = [40, 50, 60]
+    center = centers[int(np.clip(register_id, 0, 2))]
     best = None
     best_dist = 1e9
     for pitch in range(24, 84):
@@ -239,6 +272,9 @@ def _render_step(
 ) -> List["Note"]:
     from .types import Note
 
+    # rhythm mapping:
+    # if n_rhythm==2: 0=rest, 1=hit
+    # if n_rhythm>=5: 0=REST, 1=SUSTAIN, 2=HIT_ON, 3=HIT_OFF, 4=MULTI
     if n_rhythm == 2:
         if rhythm_id == 0:
             return []
@@ -246,17 +282,24 @@ def _render_step(
     else:
         if rhythm_id == 0:
             return []
-        rhythm_mode = {1: "SUSTAIN", 2: "HIT_ON", 3: "HIT_OFF", 4: "MULTI"}.get(rhythm_id, "HIT_ON")
+        rhythm_mode = {1: "SUSTAIN", 2: "HIT_ON", 3: "HIT_OFF", 4: "MULTI"}.get(int(rhythm_id), "HIT_ON")
 
-    pcs = _chord_pcs(int(chord.root_pc), str(chord.quality), tuple(getattr(chord, "extensions", ()) or ()))
+    # 0 is typically REST if you used the vocab I suggested
+    if n_degree >= 7 and degree_id == 0:
+        return []
+
+    root_pc = getattr(chord, "root_pc", None)
+    if root_pc is None:
+        return []
+
+    pcs = _chord_pcs(int(root_pc), str(getattr(chord, "quality", "maj")), tuple(getattr(chord, "extensions", ()) or ()))
     if not pcs:
         return []
 
-    root = int(chord.root_pc) % 12
+    root = int(root_pc) % 12
 
+    # degree mapping (for n_degree>=7: REST, ROOT, THIRD, FIFTH, SEVENTH, CHORD_TONE, NONCHORD)
     if n_degree >= 7:
-        if degree_id == 0:
-            return []
         if degree_id == 1:
             pc = root
         elif degree_id == 2:
@@ -271,11 +314,9 @@ def _render_step(
         else:
             pc = (root + 1) % 12
     else:
-        if degree_id == 0:
-            return []
         pc = root
 
-    pitch = _pc_to_pitch(pc, int(register_id), n_register=3)
+    pitch = _pc_to_pitch(int(pc), int(register_id))
 
     if rhythm_mode in ("SUSTAIN", "HIT_ON"):
         return [Note(pitch=pitch, start=t0, end=t0 + step_len * 0.92, velocity=velocity)]
@@ -287,6 +328,100 @@ def _render_step(
             Note(pitch=pitch, start=t0 + 0.5 * step_len, end=t0 + step_len * 0.98, velocity=velocity),
         ]
     return []
+
+
+# ---- AR model definition must match train_bass_ar.py state_dict keys ----
+
+class _BassARTransformer(nn.Module):
+    """
+    Must match train_bass_ar.py module names:
+      tok_emb, cond_proj, pos, enc, ln, lm_head
+    """
+    def __init__(self, cfg: _BassARCfg):
+        super().__init__()
+        self.cfg = cfg
+
+        # +1 for START token at id = vocab_size
+        self.tok_emb = nn.Embedding(int(cfg.vocab_size) + 1, int(cfg.d_model))
+        self.cond_proj = nn.Linear(int(cfg.feat_dim), int(cfg.d_model))
+        self.pos = nn.Embedding(int(cfg.max_steps), int(cfg.d_model))
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=int(cfg.d_model),
+            nhead=int(cfg.n_heads),
+            dim_feedforward=int(cfg.d_model) * 4,
+            dropout=float(cfg.dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=int(cfg.n_layers))
+        self.ln = nn.LayerNorm(int(cfg.d_model))
+        self.lm_head = nn.Linear(int(cfg.d_model), int(cfg.vocab_size))
+
+    def _causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
+        return torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=1)
+
+    def forward(self, x_tok: torch.Tensor, x_cond: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x_tok: (B,T) token ids, with START token id = vocab_size
+        # x_cond: (B,T,F)
+        B, T = x_tok.shape
+        device = x_tok.device
+
+        h = self.tok_emb(x_tok) + self.cond_proj(x_cond)
+        idx = torch.arange(T, device=device)
+        h = h + self.pos(idx)[None, :, :]
+
+        causal = self._causal_mask(T, device=device)
+
+        pad_mask = None
+        if attn_mask is not None:
+            pad_mask = ~attn_mask
+
+        h = self.enc(h, mask=causal, src_key_padding_mask=pad_mask)
+        h = self.ln(h)
+        return self.lm_head(h)
+
+
+def _load_bass_model(model_path: str):
+    p = Path(model_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Bass model not found: {p}")
+
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(str(p), map_location=dev)
+
+    cfg_raw = dict(ckpt.get("cfg", {}))
+    cfg_dict = _normalize_bass_ar_cfg(cfg_raw)
+    if "vocab_size" not in cfg_dict:
+        raise ValueError(
+            "This checkpoint looks like the OLD non-autoregressive bass model (missing cfg.vocab_size). "
+            "Use bass_ar_model.pt instead."
+        )
+
+    cfg = _BassARCfg(**cfg_dict)
+    model = _BassARTransformer(cfg).to(dev)
+    model.load_state_dict(ckpt["state"])
+    model.eval()
+
+    meta = ckpt.get("meta", {}) or {}
+    return model, cfg, dev, meta
+
+
+def _unpack_token(tok: int, n_degree: int, n_register: int, n_rhythm: int) -> Tuple[int, int, int]:
+    """
+    Must match preprocess pack_token:
+      tok = (deg*n_register + reg)*n_rhythm + rhy
+    """
+    deg = int(tok // (n_register * n_rhythm))
+    rem = int(tok % (n_register * n_rhythm))
+    reg = int(rem // n_rhythm)
+    rhy = int(rem % n_rhythm)
+    # safety clamps
+    deg = int(np.clip(deg, 0, n_degree - 1))
+    reg = int(np.clip(reg, 0, n_register - 1))
+    rhy = int(np.clip(rhy, 0, n_rhythm - 1))
+    return deg, reg, rhy
 
 
 def generate_bass_ml(
@@ -303,77 +438,31 @@ def generate_bass_ml(
     seed: Optional[int],
     velocity: int,
 ) -> List["Note"]:
-    import torch
 
-    p = Path(model_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Bass model not found: {p}")
+    model, cfg, dev, meta = _load_bass_model(model_path)
 
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(str(p), map_location=dev)
-
-    cfg_dict = _normalize_bass_cfg(dict(ckpt["cfg"]))
-    cfg = _BassCfg(**cfg_dict)
-
-    # build model matching training (pos emb + causal transformer + 3 heads)
-    import torch.nn as nn
-
-    class _M(nn.Module):
-        def __init__(self, cfg: _BassCfg):
-            super().__init__()
-            self.in_proj = nn.Linear(cfg.feat_dim, cfg.d_model)
-            self.pos = nn.Embedding(cfg.max_steps, cfg.d_model)
-            enc_layer = nn.TransformerEncoderLayer(
-                d_model=cfg.d_model,
-                nhead=cfg.n_heads,
-                dim_feedforward=cfg.d_model * 4,
-                dropout=cfg.dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            )
-            self.enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.n_layers)
-            self.ln = nn.LayerNorm(cfg.d_model)
-            self.head_degree = nn.Linear(cfg.d_model, cfg.n_degree)
-            self.head_register = nn.Linear(cfg.d_model, cfg.n_register)
-            self.head_rhythm = nn.Linear(cfg.d_model, cfg.n_rhythm)
-
-        def forward(self, x, attn_mask=None):
-            B, T, _ = x.shape
-            device = x.device
-            h = self.in_proj(x)
-            idx = torch.arange(T, device=device)
-            h = h + self.pos(idx)[None, :, :]
-            causal = torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=1)
-            pad_mask = None
-            if attn_mask is not None:
-                pad_mask = ~attn_mask
-            h = self.enc(h, mask=causal, src_key_padding_mask=pad_mask)
-            h = self.ln(h)
-            return self.head_degree(h), self.head_register(h), self.head_rhythm(h)
-
-    model = _M(cfg).to(dev)
-    model.load_state_dict(ckpt["state"])
-    model.eval()
-
-    meta = ckpt.get("meta", {}) or {}
     qual_vocab = list(meta.get("qual_vocab") or QUAL_VOCAB_DEFAULT)
 
     spb = float(grid.seconds_per_beat)
     step_len = max(1e-6, float(step_beats) * spb)
     n_steps = int(np.ceil(max(1e-6, float(duration_seconds)) / step_len))
 
+    # feature schema: melody(14) + key(14 if enabled) + chord(12+|qual|) + pos_bins
     mel_dim = 14
     key_dim = 14 if include_key else 0
     chord_dim = 12 + len(qual_vocab)
 
     pos_bins = None
-    for b in [2, 4, 1, 8]:
+    for b in (2, 4, 1, 8):
         if mel_dim + key_dim + chord_dim + b == int(cfg.feat_dim):
             pos_bins = b
             break
     if pos_bins is None:
-        raise ValueError(f"feat_dim mismatch: model expects {cfg.feat_dim}, cannot match schema.")
+        raise ValueError(
+            f"Bass feat_dim mismatch: model expects feat_dim={cfg.feat_dim}, "
+            f"but got mel={mel_dim}, key={key_dim}, chord={chord_dim}. "
+            f"(Could be include_key mismatch.)"
+        )
 
     kfeat = _key_feat(melody_notes) if include_key else None
 
@@ -384,7 +473,8 @@ def generate_bass_ml(
         mfeat = _mel_step_feat(melody_notes, t0, t1, step_len)
         ch = _chord_at(chords, t0 + 1e-4)
         cfeat = _chord_feat(ch, qual_vocab=qual_vocab)
-        pfeat = _pos_feat(t0, spb, pos_bins=pos_bins)
+        pfeat = _pos_feat(t0, spb, pos_bins=int(pos_bins))
+
         if kfeat is not None:
             X[i] = np.concatenate([mfeat, kfeat, cfeat, pfeat], axis=0).astype(np.float32)
         else:
@@ -392,31 +482,31 @@ def generate_bass_ml(
 
     rng = np.random.default_rng(seed if seed is not None else None)
 
-    T = X.shape[0]
-    max_steps = int(cfg.max_steps)
-    out_notes: List["Note"] = []
+    out_notes: List[Note] = []
 
-    from .types import Note, BarGrid
+    T = int(X.shape[0])
+    max_steps = int(cfg.max_steps)
+    START = int(cfg.vocab_size)  # special token id
+
+    prev_token = START
 
     start = 0
     while start < T:
         end = min(T, start + max_steps)
-        chunk = X[start:end]
         keep = end - start
 
-        x_in = np.zeros((max_steps, X.shape[1]), dtype=np.float32)
+        # cond chunk
+        x_in = np.zeros((max_steps, int(cfg.feat_dim)), dtype=np.float32)
         attn = np.zeros((max_steps,), dtype=np.bool_)
-        x_in[:keep] = chunk
+        x_in[:keep] = X[start:end]
         attn[:keep] = True
 
         xb = torch.tensor(x_in[None, :, :], dtype=torch.float32, device=dev)
         attb = torch.tensor(attn[None, :], dtype=torch.bool, device=dev)
 
-        with torch.no_grad():
-            deg_logits, reg_logits, rhy_logits = model(xb, attn_mask=attb)
-            deg_logits = deg_logits[0, :keep].detach().cpu().numpy()
-            reg_logits = reg_logits[0, :keep].detach().cpu().numpy()
-            rhy_logits = rhy_logits[0, :keep].detach().cpu().numpy()
+        # token inputs for each position j represent "previous token for step j"
+        x_tok = np.full((max_steps,), START, dtype=np.int64)
+        x_tok[0] = int(prev_token)
 
         for j in range(keep):
             step_idx = start + j
@@ -424,12 +514,21 @@ def generate_bass_ml(
             if t0 >= float(duration_seconds):
                 break
 
+            xt = torch.tensor(x_tok[None, :], dtype=torch.long, device=dev)
+            with torch.no_grad():
+                logits = model(xt, xb, attn_mask=attb)  # (1, max_steps, vocab)
+                step_logits = logits[0, j].detach().cpu().numpy()
+
+            tok = _sample_id(step_logits, temperature=float(temperature), top_k=int(top_k), rng=rng)
+
+            deg_id, reg_id, rhy_id = _unpack_token(
+                int(tok),
+                n_degree=int(cfg.n_degree),
+                n_register=int(cfg.n_register),
+                n_rhythm=int(cfg.n_rhythm),
+            )
+
             ch = _chord_at(chords, t0 + 1e-4)
-
-            deg_id = _sample_id(deg_logits[j], temperature=float(temperature), top_k=int(top_k), rng=rng)
-            reg_id = int(np.argmax(reg_logits[j]))
-            rhy_id = _sample_id(rhy_logits[j], temperature=float(temperature), top_k=int(top_k), rng=rng)
-
             out_notes.extend(
                 _render_step(
                     t0=t0,
@@ -443,6 +542,11 @@ def generate_bass_ml(
                     n_rhythm=int(cfg.n_rhythm),
                 )
             )
+
+            # shift-right for next position
+            if (j + 1) < max_steps:
+                x_tok[j + 1] = int(tok)
+            prev_token = int(tok)
 
         start = end
 
@@ -475,7 +579,7 @@ def generate(
     chord_change_penalty: float = typer.Option(0.15, "--chord-change-penalty", help="Change penalty for smoothing (if not stochastic)"),
     # NEW: bass ML options
     bass_mode: str = typer.Option("rules", "--bass-mode", help="Bass: rules | ml"),
-    bass_model: Path = typer.Option(Path("data/ml/bass_model.pt"), "--bass-model", help="Path to ML bass model (.pt)"),
+    bass_model: Path = typer.Option(Path("data/ml/bass_ar_model.pt"), "--bass-model", help="Path to ML bass AR model (.pt)"),
     bass_step_beats: float = typer.Option(2.0, "--bass-step-beats", help="Bass step size in beats (must match training)"),
     bass_include_key: bool = typer.Option(True, "--bass-include-key/--no-bass-include-key", help="Include key features for bass"),
     bass_temp: float = typer.Option(0.0, "--bass-temp", help="Bass temperature (0 = greedy)"),
