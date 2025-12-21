@@ -79,27 +79,89 @@ def _median_pitch(inst: pretty_midi.Instrument) -> float:
 
 def _auto_pick_with_intro(
     pm: pretty_midi.PrettyMIDI,
-    info,
-    melody_inst: pretty_midi.Instrument,
-    sel,
+    info_or_sel,
+    melody_inst: Optional[pretty_midi.Instrument] = None,
+    sel=None,
+    max_intro: int = 2,
 ) -> tuple[list[pretty_midi.Instrument], list[int]]:
     """
-    Use auto-picked melody_inst as main lead, but also add a short, high-pitch intro lead track if it exists.
-    Returns (melody_source_insts, picked_intro_idxs).
-    """
-    song_end = float(info.duration) if getattr(info, "duration", 0.0) and info.duration > 1e-6 else float(pm.get_end_time())
-    main_med = _median_pitch(melody_inst)
+    Backwards compatible:
+      - _auto_pick_with_intro(pm, sel)
+      - _auto_pick_with_intro(pm, info, melody_inst, sel)
+      - _auto_pick_with_intro(pm, info, sel)   (rare, but supported)
 
+    Also supports multi-lead selection via sel.instrument_indices.
+    Returns:
+      (melody_source_insts, picked_intro_idxs)
+    """
+    info = None
+
+    # Case A: called as (pm, sel)
+    if sel is None and melody_inst is None and hasattr(info_or_sel, "instrument_index"):
+        sel = info_or_sel
+
+    # Case B: called as (pm, info, sel) where 3rd arg is actually sel
+    elif sel is None and melody_inst is not None and hasattr(melody_inst, "instrument_index") and not hasattr(melody_inst, "notes"):
+        info = info_or_sel
+        sel = melody_inst
+        melody_inst = None
+
+    # Case C: called as (pm, info, melody_inst, sel)
+    else:
+        info = info_or_sel
+
+    if sel is None:
+        raise ValueError("_auto_pick_with_intro: could not determine `sel` (melody selection).")
+
+    # Base lead indices: multi-select if available, else fallback to single
+    base_idxs = list(getattr(sel, "instrument_indices", None) or [int(getattr(sel, "instrument_index", 0))])
+
+    # Sanitize indices (in-range, not drums)
+    valid_base: list[int] = []
+    for i in base_idxs:
+        i = int(i)
+        if 0 <= i < len(pm.instruments) and (not pm.instruments[i].is_drum) and pm.instruments[i].notes:
+            if i not in valid_base:
+                valid_base.append(i)
+
+    if not valid_base:
+        # ultimate fallback: first non-drum with notes
+        for i, inst in enumerate(pm.instruments):
+            if (not inst.is_drum) and inst.notes:
+                valid_base = [i]
+                break
+
+    if melody_inst is None:
+        melody_inst = pm.instruments[valid_base[0]]
+
+    # Use info.duration if available, else end_time
+    song_end = float(getattr(info, "duration", 0.0) or 0.0)
+    if song_end <= 1e-6:
+        song_end = float(pm.get_end_time())
+
+    # Median pitch of the combined base lead(s)
+    all_base_pitches: list[int] = []
+    for i in valid_base:
+        all_base_pitches.extend([int(n.pitch) for n in pm.instruments[i].notes])
+    if all_base_pitches:
+        all_base_pitches.sort()
+        m = len(all_base_pitches)
+        main_med = float(all_base_pitches[m // 2]) if (m % 2 == 1) else 0.5 * (all_base_pitches[m // 2 - 1] + all_base_pitches[m // 2])
+    else:
+        main_med = _median_pitch(melody_inst)
+
+    # Find short, high-pitch intro candidates (excluding *all* base leads)
+    base_set = set(valid_base)
     intro_candidates: list[tuple[int, float, int]] = []  # (idx, median_pitch, note_count)
 
     for idx, inst in enumerate(pm.instruments):
-        if idx == sel.instrument_index:
+        if idx in base_set:
             continue
         if inst.is_drum or not inst.notes:
             continue
 
-        start = min(n.start for n in inst.notes)
-        end = max(n.end for n in inst.notes)
+        start = float(min(n.start for n in inst.notes))
+        end = float(max(n.end for n in inst.notes))
         span = max(1e-6, end - start)
         coverage = span / max(1e-6, song_end)
 
@@ -116,16 +178,16 @@ def _auto_pick_with_intro(
             intro_candidates.append((idx, med, note_count))
 
     intro_candidates.sort(key=lambda x: (-x[1], -x[2]))
-    picked_intro_idxs = [idx for (idx, _, _) in intro_candidates[:2]]
+    picked_intro_idxs = [idx for (idx, _, _) in intro_candidates[: max(0, int(max_intro))]]
 
+    # Used indices: intro first, then ALL base leads
     used_indices: list[int] = []
-    for i in picked_intro_idxs + [sel.instrument_index]:
+    for i in picked_intro_idxs + valid_base:
         if i not in used_indices:
             used_indices.append(i)
 
     melody_source_insts = [pm.instruments[i] for i in used_indices]
     return melody_source_insts, picked_intro_idxs
-
 
 # ----------------------------
 # Auto settings (kept)
@@ -495,6 +557,7 @@ def run_pipeline(
         f.write(midi_bytes)
         in_path = Path(f.name)
 
+    # If the user manually picked tracks, we still let that override auto
     first_idx = melody_track_indices[0] if melody_track_indices else None
     pm, info, grid, melody_inst, sel = load_and_prepare(in_path, melody_instrument_index=first_idx)
 
@@ -505,16 +568,43 @@ def run_pipeline(
     if melody_track_indices:
         valid: list[int] = []
         for i in melody_track_indices:
-            if 0 <= i < len(pm.instruments):
-                if not pm.instruments[i].is_drum:
-                    valid.append(i)
+            if 0 <= i < len(pm.instruments) and not pm.instruments[i].is_drum:
+                valid.append(i)
         if not valid:
             raise RuntimeError("No valid (non-drum) melody instruments selected.")
         melody_source_insts = [pm.instruments[i] for i in valid]
         used_melody_indices = valid
     else:
-        melody_source_insts, picked_intro_idxs = _auto_pick_with_intro(pm, info, melody_inst, sel)
-        used_melody_indices = [sel.instrument_index] + picked_intro_idxs
+        # NEW: use multi-lead selection from midi_io (fallback to single)
+        base_idxs = getattr(sel, "instrument_indices", None)
+        if not base_idxs:
+            base_idxs = [getattr(sel, "instrument_index", 0)]
+
+        base_valid: list[int] = []
+        for i in base_idxs:
+            try:
+                ii = int(i)
+            except Exception:
+                continue
+            if 0 <= ii < len(pm.instruments) and not pm.instruments[ii].is_drum:
+                base_valid.append(ii)
+
+        # hard fallback if something is off
+        if not base_valid:
+            fb = int(getattr(sel, "instrument_index", 0))
+            if 0 <= fb < len(pm.instruments) and not pm.instruments[fb].is_drum:
+                base_valid = [fb]
+
+        # Keep your intro heuristic, but don't let it "steal" one of the base leads
+        _, picked_intro_idxs = _auto_pick_with_intro(pm, info, melody_inst, sel)
+        picked_intro_idxs = [i for i in picked_intro_idxs if i not in base_valid]
+
+        used_melody_indices = []
+        for i in picked_intro_idxs + base_valid:
+            if i not in used_melody_indices:
+                used_melody_indices.append(i)
+
+        melody_source_insts = [pm.instruments[i] for i in used_melody_indices]
 
     # Combine selected lead instruments for analysis
     analysis_inst = pretty_midi.Instrument(program=int(melody_source_insts[0].program), is_drum=False, name="Analysis")
@@ -587,6 +677,7 @@ def run_pipeline(
         pad_program=int(pad_program),
     )
 
+    # Render lead from original instruments + backing tracks
     write_midi(
         out_path,
         [],
@@ -608,14 +699,23 @@ def run_pipeline(
         "key": key,
         "mood": mood,
         "harmony_mode": harmony_mode,
-        "pad_program": int(pad_program),
-        "bass_program": int(bass_program),
+        "chord_model_path": str(chord_model_path),
+        "chord_step_beats": float(chord_step_beats),
+        "chord_stochastic": bool(chord_stochastic),
+        "chord_temperature": float(chord_temp),
+        "chord_top_k": int(chord_top_k),
+        "chord_repeat_penalty": float(chord_repeat_penalty),
+        "chord_change_penalty": float(chord_change_penalty),
+        "bass_mode": "rules",
         "chords": chords,
         "arrangement_counts": {k: len(v) for k, v in arrangement.tracks.items()},
         "instrument_list": [
             {"idx": i, "name": (inst.name or f"Instrument {i}"), "is_drum": inst.is_drum, "notes": len(inst.notes)}
             for i, inst in enumerate(pm.instruments)
         ],
+        "pad_program": int(pad_program),
+        "bass_program": int(bass_program),
+        "melody_program": int(melody_source_insts[0].program) if melody_source_insts else None,
     }
     return out_path, meta
 

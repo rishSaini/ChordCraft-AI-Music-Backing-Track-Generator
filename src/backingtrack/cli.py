@@ -614,13 +614,29 @@ def generate(
         melody_source_insts = [pm.instruments[i] for i in requested]
         typer.echo(f"Using melody tracks (lead): {requested}")
     else:
-        melody_source_insts = [melody_inst]
+        # NEW: use multi-lead selection from midi_io (fallback to single)
+        base_idxs = getattr(sel, "instrument_indices", None)
+        if not base_idxs:
+            base_idxs = [sel.instrument_index]
+
+        base_valid = []
+        for i in base_idxs:
+            ii = int(i)
+            if 0 <= ii < len(pm.instruments) and not pm.instruments[ii].is_drum:
+                base_valid.append(ii)
+
+        if not base_valid:
+            base_valid = [sel.instrument_index]
+
+        # Keep your existing intro heuristic, but exclude any base lead tracks
+        melody_source_insts = [pm.instruments[i] for i in base_valid]
+
         song_end = float(info.duration) if info.duration > 1e-6 else float(pm.get_end_time())
         main_med = _median_pitch(melody_inst)
 
         intro_candidates: list[tuple[int, float, int]] = []
         for idx, inst in enumerate(pm.instruments):
-            if idx == sel.instrument_index:
+            if idx in base_valid:
                 continue
             if inst.is_drum or not inst.notes:
                 continue
@@ -635,13 +651,19 @@ def generate(
 
         intro_candidates.sort(key=lambda x: (-x[1], -x[2]))
         picked_intro_idxs = [idx for (idx, _, _) in intro_candidates[:2]]
+
         if picked_intro_idxs:
-            melody_source_insts = [pm.instruments[i] for i in picked_intro_idxs] + melody_source_insts
+            used = []
+            for i in picked_intro_idxs + base_valid:
+                if i not in used:
+                    used.append(i)
+            melody_source_insts = [pm.instruments[i] for i in used]
 
         typer.echo(
-            f"Auto-picked melody track: idx={sel.instrument_index}, name='{sel.instrument_name}', is_drum={sel.is_drum}"
+            f"Auto-picked melody tracks (lead): {base_valid}"
             + (f" | plus intro tracks: {picked_intro_idxs}" if picked_intro_idxs else "")
-        )
+        )   
+
 
     typer.echo(f"Tempo: {info.tempo_bpm:.2f} BPM | Time signature: {info.time_signature.numerator}/{info.time_signature.denominator}")
     typer.echo(f"Duration: {info.duration:.2f}s")

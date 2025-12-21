@@ -15,43 +15,23 @@ DEFAULT_TEMPO_BPM = 120.0
 DEFAULT_TIME_SIGNATURE = TimeSignature(4, 4)
 
 
-@dataclass(frozen=True)
-class MelodySelection:
-    """
-    What we chose as the melody track(s) from the MIDI.
-
-    Backward compatible:
-      - instrument_index / instrument_name / is_drum describe the PRIMARY melody track.
-    New:
-      - instrument_indices / instrument_names describe the full auto-selected melody group
-        (e.g., piccolo + steel drum).
-    """
-    instrument_index: int
-    instrument_name: str
-    is_drum: bool
-
-    instrument_indices: tuple[int, ...] = ()
-    instrument_names: tuple[str, ...] = ()
-
-
 def load_midi(path: str | Path) -> pretty_midi.PrettyMIDI:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"MIDI file not found: {p}")
-    if p.suffix.lower() not in {".mid", ".midi"}:
-        raise ValueError(f"Expected a .mid or .midi file, got: {p.name}")
-
-    return pretty_midi.PrettyMIDI(str(p))
+    return pretty_midi.PrettyMIDI(str(path))
 
 
 def extract_midi_info(pm: pretty_midi.PrettyMIDI) -> MidiInfo:
     duration = float(pm.get_end_time())
 
-    tempo_times, tempi = pm.get_tempo_changes()
+    tempo_times, tempi = pm.get_tempo_changes()  # ✅ correct order
+    tempo_bpm = DEFAULT_TEMPO_BPM
+
     if len(tempi) > 0:
-        tempo_bpm = float(tempi[0])
-    else:
-        tempo_bpm = DEFAULT_TEMPO_BPM
+        # some MIDIs can have weird 0/negative tempo entries; pick first valid
+        for t in tempi:
+            t = float(t)
+            if t > 0:
+                tempo_bpm = t
+                break
 
     if pm.time_signature_changes:
         ts0 = min(pm.time_signature_changes, key=lambda ts: ts.time)
@@ -59,8 +39,7 @@ def extract_midi_info(pm: pretty_midi.PrettyMIDI) -> MidiInfo:
     else:
         time_signature = DEFAULT_TIME_SIGNATURE
 
-    return MidiInfo(duration=duration, tempo_bpm=tempo_bpm, time_signature=time_signature)
-
+    return MidiInfo(duration=duration, tempo_bpm=float(tempo_bpm), time_signature=time_signature)
 
 def build_bar_grid(info: MidiInfo, start_time: float = 0.0) -> BarGrid:
     return BarGrid(
@@ -70,15 +49,26 @@ def build_bar_grid(info: MidiInfo, start_time: float = 0.0) -> BarGrid:
     )
 
 
+@dataclass(frozen=True)
+class MelodySelection:
+    instrument_index: int
+    instrument_name: str
+    is_drum: bool
+
+    # NEW: group selection (multiple lead instruments)
+    instrument_indices: tuple[int, ...]
+    instrument_names: tuple[str, ...]
+
+
 def _span(inst: pretty_midi.Instrument) -> tuple[float, float, float]:
-    """(start, end, span_seconds) based on note times."""
+    if not inst.notes:
+        return 0.0, 0.0, 1e-6
     s = float(min(n.start for n in inst.notes))
     e = float(max(n.end for n in inst.notes))
     return s, e, max(1e-6, e - s)
 
 
 def _overlap_ratio(a0: float, a1: float, b0: float, b1: float) -> float:
-    """Overlap / min(spanA, spanB) in [0..1]."""
     inter = max(0.0, min(a1, b1) - max(a0, b0))
     span_a = max(1e-6, a1 - a0)
     span_b = max(1e-6, b1 - b0)
@@ -86,10 +76,7 @@ def _overlap_ratio(a0: float, a1: float, b0: float, b1: float) -> float:
 
 
 def _polyphony_ratio(inst: pretty_midi.Instrument) -> float:
-    """
-    Approx fraction of active time where >=2 notes are sounding.
-    Melody tends to be ~0, pads/chords higher.
-    """
+    """Fraction of active time where >=2 notes are sounding."""
     if not inst.notes:
         return 1.0
 
@@ -108,54 +95,54 @@ def _polyphony_ratio(inst: pretty_midi.Instrument) -> float:
         total += dt
         if active >= 2:
             poly_time += dt
-
     return float(poly_time / max(1e-6, total))
 
 
-def _chordiness(inst: pretty_midi.Instrument, window_s: float = 0.05) -> float:
+def _chordiness(inst: pretty_midi.Instrument) -> float:
     """
-    Fraction of note onsets that occur "in a chord" (another onset within window_s).
-    Chordal accompaniment tends to have higher chordiness.
+    Rough "chordiness": fraction of notes that start within a very small window
+    of another note (i.e., stacked onsets).
     """
-    if len(inst.notes) < 3:
+    if len(inst.notes) < 2:
         return 0.0
-    starts = np.array(sorted(float(n.start) for n in inst.notes), dtype=np.float64)
-    # Count onsets that have a neighbor within window_s
-    diffs = np.diff(starts)
-    near_next = diffs <= float(window_s)
-    # onset i is chordy if near next OR previous is near_next
-    chordy = np.zeros_like(starts, dtype=bool)
-    chordy[:-1] |= near_next
-    chordy[1:] |= near_next
-    return float(chordy.mean())
+    starts = sorted(float(n.start) for n in inst.notes)
+    eps = 0.03
+    close = 0
+    for a, b in zip(starts, starts[1:]):
+        if (b - a) <= eps:
+            close += 1
+    return float(close / max(1, len(starts) - 1))
+
+
+def _is_bass_like(program: int, median_pitch: float, p90: float, low_cut: float, name: str) -> bool:
+    name_l = (name or "").lower()
+
+    # Strong GM bass program block
+    if 32 <= int(program) <= 39:
+        return True
+
+    # Strong name cues (treat as bass even if played high)
+    bass_tokens = ("bass", "fretless", "upright", "contrabass", "subbass")
+    if any(tok in name_l for tok in bass_tokens):
+        return True
+
+    # Pitch-based backup
+    if median_pitch < (low_cut + 10.0) and p90 < (low_cut + 16.0):
+        return True
+
+    return False
 
 
 def pick_melody_instrument(
     pm: pretty_midi.PrettyMIDI,
     instrument_index: Optional[int] = None,
-) -> Tuple[pretty_midi.Instrument, MelodySelection]:
-    """
-    Choose which instrument track(s) are "the melody".
-
-    If instrument_index is provided: pick that exact instrument (single).
-    Otherwise:
-      1) score tracks and pick PRIMARY melody
-      2) also pick a small group of other lead-like tracks that overlap in time
-         (e.g., steel drum doubling the melody)
-
-    Return:
-      - melody_inst: the PRIMARY instrument (backward-compatible)
-      - selection: includes .instrument_indices for the whole melody group
-    """
+) -> tuple[pretty_midi.Instrument, MelodySelection]:
     instruments = pm.instruments
-    if not instruments:
-        raise ValueError("No instruments found in MIDI.")
 
-    # Explicit index override (single-track)
     if instrument_index is not None:
         if instrument_index < 0 or instrument_index >= len(instruments):
-            raise IndexError(
-                f"instrument_index out of range: {instrument_index} "
+            raise ValueError(
+                f"instrument_index {instrument_index} out of range "
                 f"(valid 0..{len(instruments)-1})"
             )
         inst = instruments[instrument_index]
@@ -168,146 +155,190 @@ def pick_melody_instrument(
         )
         return inst, sel
 
-    # Score candidates
     song_end = float(pm.get_end_time()) or 1.0
 
-    best_idx: Optional[int] = None
-    best_score = -1e18
-
+    # Build feature table
     feats: dict[int, dict] = {}
+    medians: list[float] = []
 
     for idx, inst in enumerate(instruments):
         if inst.is_drum or not inst.notes:
             continue
 
         pitches = np.array([n.pitch for n in inst.notes], dtype=np.float32)
-        note_count = len(inst.notes)
+        note_count = int(len(inst.notes))
 
         s, e, span = _span(inst)
-        coverage = span / max(1e-6, song_end)
-        end_ratio = e / max(1e-6, song_end)
+        coverage = float(span / max(1e-6, song_end))
+        end_ratio = float(e / max(1e-6, song_end))
 
         median_pitch = float(np.median(pitches))
-        p90_pitch = float(np.percentile(pitches, 90))
+        p90 = float(np.percentile(pitches, 90))
+        p10 = float(np.percentile(pitches, 10))
 
-        poly = _polyphony_ratio(inst)
-        chordy = _chordiness(inst, window_s=0.05)
+        poly = float(_polyphony_ratio(inst))
+        chordy = float(_chordiness(inst))
 
-        onset_rate = float(note_count / max(1e-6, span))  # notes/sec
-
-        name = (inst.name or "").strip().lower()
-        penalty = 0.0
-        bonus = 0.0
-
-        for bad in ("bass", "pad", "chord", "harmony", "accomp", "comp", "rhythm"):
-            if bad in name:
-                penalty += 25.0
-
-        for good in ("melody", "lead", "vocal", "voice", "solo", "theme"):
-            if good in name:
-                bonus += 30.0
-
-        # discourage tiny one-off/FX tracks
-        short_pen = 0.0
-        if coverage < 0.18:
-            short_pen = 140.0 * (0.18 - coverage) / 0.18
-
-        # Scoring:
-        # - still likes higher pitch, but less dominant than before
-        # - heavily rewards coverage/end
-        # - penalizes polyphony/chordiness (pads)
-        score = (
-            0.75 * median_pitch
-            + 0.45 * p90_pitch
-            + 6.0 * np.log1p(note_count)
-            + 135.0 * coverage
-            + 30.0 * end_ratio
-            + 10.0 * np.log1p(onset_rate)
-            + bonus
-            - penalty
-            - 90.0 * poly
-            - 70.0 * chordy
-            - short_pen
-        )
+        onset_rate = float(note_count / max(1e-6, span))  # notes per second (on active span)
+        high = float(p90 > 96.0)  # very high register (often FX)
+        low = float(p10 < 45.0)   # low register (often bass / comp)
 
         feats[idx] = {
-            "score": float(score),
-            "start": s,
-            "end": e,
-            "span": span,
+            "idx": idx,
+            "name": inst.name or f"Instrument {idx}",
+            "program": int(inst.program),
+            "notes": note_count,
+            "start": float(s),
+            "end": float(e),
+            "span": float(span),
             "coverage": float(coverage),
             "end_ratio": float(end_ratio),
-            "median_pitch": float(median_pitch),
-            "p90_pitch": float(p90_pitch),
+            "median": float(median_pitch),
+            "p90": float(p90),
+            "p10": float(p10),
             "poly": float(poly),
             "chordy": float(chordy),
-            "note_count": int(note_count),
+            "onset_rate": float(onset_rate),
+            "high": float(high),
+            "low": float(low),
         }
+        medians.append(median_pitch)
 
-        if score > best_score:
-            best_score = float(score)
-            best_idx = int(idx)
+    if not feats:
+        raise ValueError("MIDI contains no notes in non-drum instruments.")
 
-    # Fallback: first with notes
-    if best_idx is None:
-        for idx, inst in enumerate(instruments):
-            if inst.notes:
-                best_idx = idx
-                break
-    if best_idx is None:
-        raise ValueError("MIDI contains no notes in any instrument track.")
+    # dynamic low-cut based on global median
+    global_median = float(np.median(np.array(medians, dtype=np.float32))) if medians else 60.0
+    low_cut = max(36.0, min(55.0, global_median - 10.0))
 
-    # Pick a melody GROUP: other lead-like tracks near the top score that overlap in time
-    max_tracks = 4
-    score_margin = 35.0      # include tracks within best_score - margin
-    min_overlap = 0.30       # must overlap primary in time
-    max_poly = 0.35          # avoid chordal/pad tracks
-    max_chordy = 0.40
+    def melody_score(f: dict) -> float:
+        # Weighted score to find a primary lead candidate (still conservative)
+        pitch_term = 0.0
+        if f["median"] >= low_cut:
+            pitch_term += 12.0
+        if f["p90"] >= (low_cut + 18.0):
+            pitch_term += 12.0
 
-    primary = feats[best_idx]
-    picked = [best_idx]
+        score = (
+            + 140.0 * f["coverage"]
+            + 30.0 * f["end_ratio"]
+            + 8.0 * np.log1p(f["notes"])
+            + 30.0 * np.log1p(f["onset_rate"])
+            + pitch_term
+            - 230.0 * f["poly"]
+            - 170.0 * f["chordy"]
+            - 18.0 * f["high"]
+            - 25.0 * f["low"]
+        )
+        return float(score)
 
-    # sort by score descending
-    candidates = sorted(
-        (i for i in feats.keys() if i != best_idx),
-        key=lambda i: feats[i]["score"],
-        reverse=True,
-    )
+    # Filter out bass-like tracks for PRIMARY melody selection
+    primary_candidates: list[int] = []
+    for idx, f in feats.items():
+        if _is_bass_like(f["program"], f["median"], f["p90"], low_cut, f["name"]):
+            continue
+        # drop tiny/FX tracks
+        if f["notes"] < 20 or f["coverage"] < 0.10:
+            continue
+        primary_candidates.append(idx)
 
-    for i in candidates:
-        if len(picked) >= max_tracks:
+    # If we filtered too hard, fall back to all non-drum tracks (but still keep bass programs blocked)
+    if not primary_candidates:
+        for idx, f in feats.items():
+            if 32 <= f["program"] <= 39:
+                continue
+            primary_candidates.append(idx)
+
+    scored = sorted(primary_candidates, key=lambda i: melody_score(feats[i]), reverse=True)
+
+    # Primary = best score
+    primary_idx = scored[0]
+    primary_f = feats[primary_idx]
+
+    # Build melody GROUP: include other lead-like tracks.
+    #
+    # Real-world MIDI files often "spread" the lead across multiple instruments (e.g., piccolo +
+    # steel drum + other melodic layers), sometimes with little/no time overlap (handoffs).
+    # So the group logic should be *looser* than the primary-pick logic, while still avoiding
+    # bass/pad/chordal tracks.
+    score_margin = 45.0          # how far below the primary score we still accept
+    max_tracks = 8
+    min_overlap = 0.10           # prefer some overlap, but don't require much
+    min_notes = 15
+    min_coverage = 0.06          # fraction of song duration the track spans (based on start/end span)
+
+    primary_score = melody_score(primary_f)
+    group: list[int] = [primary_idx]
+
+    for i in scored[1:]:
+        if len(group) >= max_tracks:
             break
-
         f = feats[i]
-        if f["score"] < (best_score - score_margin):
-            break  # since sorted, remaining will be worse
 
-        if f["poly"] > max_poly or f["chordy"] > max_chordy:
+        # keep only reasonably good melodic candidates
+        if melody_score(f) < (primary_score - score_margin):
             continue
 
-        ov = _overlap_ratio(primary["start"], primary["end"], f["start"], f["end"])
-        if ov < min_overlap:
+        # drop tiny/FX tracks
+        if f["notes"] < min_notes or f["coverage"] < min_coverage:
             continue
 
-        # keep if it looks "melody-ish" (not way down in pitch)
-        # allow some distance (steel drum etc.), but reject very low comp tracks
-        if f["p90_pitch"] < (primary["median_pitch"] - 18.0):
+        # avoid pads/chords
+        if f["poly"] > 0.50 or f["chordy"] > 0.55:
             continue
 
-        picked.append(i)
+        # avoid bass-like secondary too
+        if _is_bass_like(f["program"], f["median"], f["p90"], low_cut, f["name"]):
+            continue
 
-    picked = tuple(int(i) for i in picked)
+        # keep generally "melodic register" (cuts out low-mid comp patterns)
+        if f["p90"] < (low_cut + 18.0):
+            continue
+
+        # prefer overlap, but allow handoffs if the track is substantial
+        ov = _overlap_ratio(primary_f["start"], primary_f["end"], f["start"], f["end"])
+        if ov < min_overlap and f["coverage"] < 0.18:
+            continue
+
+        group.append(i)
+
+    # If we still only found one instrument, fall back to adding the next-best lead-like tracks,
+    # even if they don't overlap (common for "melody swaps" across sections).
+    if len(group) == 1:
+        for i in scored[1:]:
+            if len(group) >= max_tracks:
+                break
+            f = feats[i]
+            if f["notes"] < 20 or f["coverage"] < 0.08:
+                continue
+            if f["poly"] > 0.50 or f["chordy"] > 0.55:
+                continue
+            if _is_bass_like(f["program"], f["median"], f["p90"], low_cut, f["name"]):
+                continue
+            if f["p90"] < (low_cut + 18.0):
+                continue
+            group.append(i)
+
+    # Optional: choose the "most melodic" as primary among the group
+    # (prevents sparse countermelody from being primary)
+    def mass_metric(f: dict) -> float:
+        # favors sustained, non-chordal lead content
+        return float(f["notes"] * f["coverage"] * (1.0 - f["poly"]) * (1.0 - f["chordy"]))
+
+    primary_idx = max(group, key=lambda i: mass_metric(feats[i]))
+    primary_inst = instruments[primary_idx]
+
+    picked = tuple(int(i) for i in group)
     names = tuple((instruments[i].name or f"Instrument {i}") for i in picked)
 
-    inst = instruments[best_idx]
     sel = MelodySelection(
-        instrument_index=int(best_idx),
-        instrument_name=inst.name or f"Instrument {best_idx}",
-        is_drum=bool(inst.is_drum),
+        instrument_index=int(primary_idx),
+        instrument_name=primary_inst.name or f"Instrument {primary_idx}",
+        is_drum=bool(primary_inst.is_drum),
         instrument_indices=picked,
         instrument_names=names,
     )
-    return inst, sel
+    return primary_inst, sel
 
 
 def load_and_prepare(
